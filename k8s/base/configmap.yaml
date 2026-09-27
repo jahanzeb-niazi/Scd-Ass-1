@@ -1,0 +1,13 @@
+# Non-secret configuration only (§3.3). Anything sensitive goes in secret.yaml instead.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backend-config
+  namespace: civicpulse
+data:
+  ENVIRONMENT: "production"
+  TRIAGE_PROVIDER: "simulated"   # TODO(you): switch to "llm" once you've validated the Secret is wired
+  REDIS_URL: "redis://redis:6379/0"
+  # TODO(you): add any other non-secret Settings fields from backend/app/config.py
+  # that need to differ between overlays/dev and overlays/prod (patch via Kustomize
+  # in k8s/overlays/*/kustomization.yaml rather than editing this base file directly).
