@@ -1,40 +1,41 @@
-"""
-Explicit transition table for complaint status (§2.2 domain rules), NOT a
-chain of if-statements. resolved and rejected are terminal.
+"""Complaint status state machine, as an explicit transition table.
 
-    open -> in_progress
-    open -> rejected
-    in_progress -> resolved
-    in_progress -> rejected
+    open ──► in_progress ──► resolved
+      │           │
+      └──► rejected ◄┘
 
-Everything else must raise InvalidTransitionError, which the route layer
-turns into a 409 naming the attempted transition.
+resolved and rejected are terminal. Anything not in the table is a 409.
+The frontend never duplicates this table: each complaint returned by the API
+carries `allowed_transitions`, computed here.
 """
+
 from __future__ import annotations
 
-from app.db.models import Status
+from types import MappingProxyType
 
-ALLOWED_TRANSITIONS: dict[Status, set[Status]] = {
-    Status.OPEN: {Status.IN_PROGRESS, Status.REJECTED},
-    Status.IN_PROGRESS: {Status.RESOLVED, Status.REJECTED},
-    Status.RESOLVED: set(),   # terminal
-    Status.REJECTED: set(),   # terminal
-}
+from app.domain import Status
 
+TRANSITIONS: MappingProxyType[Status, frozenset[Status]] = MappingProxyType(
+    {
+        Status.OPEN: frozenset({Status.IN_PROGRESS, Status.REJECTED}),
+        Status.IN_PROGRESS: frozenset({Status.RESOLVED, Status.REJECTED}),
+        Status.RESOLVED: frozenset(),
+        Status.REJECTED: frozenset(),
+    }
+)
 
-class InvalidTransitionError(Exception):
-    def __init__(self, current: Status, attempted: Status) -> None:
-        self.current = current
-        self.attempted = attempted
-        super().__init__(f"cannot transition from {current.value} to {attempted.value}")
-
-
-def validate_transition(current: Status, attempted: Status) -> None:
-    if attempted not in ALLOWED_TRANSITIONS.get(current, set()):
-        raise InvalidTransitionError(current, attempted)
+# Stable display order for allowed_transitions in API responses.
+_ORDER = (Status.OPEN, Status.IN_PROGRESS, Status.RESOLVED, Status.REJECTED)
 
 
-# TODO(you): write tests/test_state_machine.py covering every legal transition
-# AND every illegal one (including same-state "transitions" and transitions
-# out of terminal states) — this table is small enough that 100% coverage of
-# it is cheap and expected.
+def can_transition(current: Status, target: Status) -> bool:
+    return target in TRANSITIONS[current]
+
+
+def allowed_from(current: Status) -> list[Status]:
+    allowed = TRANSITIONS[current]
+    return [s for s in _ORDER if s in allowed]
+
+
+def is_terminal(status: Status) -> bool:
+    return not TRANSITIONS[status]

@@ -1,32 +1,27 @@
-<<<<<<< HEAD
-.env
-*.pem
-*.key
-=======
 # Secrets — never commit
 .env
 .env.*
 !.env.example
 
-# Python
-__pycache__/
-*.pyc
+# --- python ---
 .venv/
+__pycache__/
+*.py[cod]
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-htmlcov/
 .coverage
+coverage.xml
+htmlcov/
 
-# Node
+# --- node ---
 node_modules/
-dist/
-coverage/
+frontend/dist/
+frontend/coverage/
+*.tsbuildinfo
 
-# OS / editor
-.DS_Store
+# --- editors / OS ---
 .idea/
 .vscode/
+.DS_Store
 
-# Evidence screenshots are tracked intentionally (docs/evidence/) — do not ignore that dir
->>>>>>> 764f733935bf6b3ed4914b217c365cb1c323ebe9

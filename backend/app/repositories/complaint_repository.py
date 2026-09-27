@@ -1,62 +1,173 @@
-"""
-All SQL lives here, and nowhere else (§2.2 layering). Services call this
-repository; this repository never contains business rules (e.g. it should not
-decide whether a status transition is valid — that's app/services/state_machine.py).
-"""
+"""Complaint persistence. All SQL in the application lives in this package."""
+
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import datetime
 
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import Engine, func, select, text
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.orm import Session
 
-from app.db.models import Complaint, Category, Priority, Status
+from app.domain import Category, Priority, Status, TriagedBy
+from app.repositories.models import ComplaintRow
+
+
+@dataclass(frozen=True)
+class NewComplaint:
+    id: uuid.UUID
+    text: str
+    location: str
+    reporter_contact: str | None
+    category: Category
+    priority: Priority
+    ai_summary: str | None
+    triaged_by: TriagedBy
+    triage_latency_ms: int
+    status: Status = Status.OPEN
+    created_at: datetime | None = None  # seed data sets this; normal inserts use now()
+
+
+@dataclass(frozen=True)
+class ComplaintFilter:
+    category: Category | None = None
+    priority: Priority | None = None
+    status: Status | None = None
+
+
+@dataclass(frozen=True)
+class StatsSnapshot:
+    total: int
+    by_category: dict[str, int]
+    by_priority: dict[str, int]
+    by_status: dict[str, int]
 
 
 class ComplaintRepository:
-    def __init__(self, session: AsyncSession) -> None:
-        self._session = session
+    def __init__(self, session: Session) -> None:
+        self._s = session
 
-    async def create(self, complaint: Complaint) -> Complaint:
-        # TODO(you): self._session.add(complaint); await self._session.commit();
-        # await self._session.refresh(complaint); return complaint
-        raise NotImplementedError
+    # -- writes ------------------------------------------------------------
+    def add(self, c: NewComplaint) -> ComplaintRow:
+        row = ComplaintRow(
+            id=c.id,
+            text=c.text,
+            location=c.location,
+            reporter_contact=c.reporter_contact,
+            category=c.category,
+            priority=c.priority,
+            status=c.status,
+            ai_summary=c.ai_summary,
+            triaged_by=c.triaged_by,
+            triage_latency_ms=c.triage_latency_ms,
+        )
+        self._s.add(row)
+        self._s.flush()
+        self._s.refresh(row)  # pull server defaults (created_at, updated_at)
+        return row
 
-    async def get_by_id(self, complaint_id: uuid.UUID) -> Complaint | None:
-        # TODO(you): implement with select(Complaint).where(Complaint.id == complaint_id)
-        raise NotImplementedError
+    def add_many_ignore_existing(self, items: Iterable[NewComplaint]) -> int:
+        """Idempotent bulk insert used by the seed: existing ids are skipped."""
+        rows = [
+            {
+                "id": c.id,
+                "text": c.text,
+                "location": c.location,
+                "reporter_contact": c.reporter_contact,
+                "category": c.category,
+                "priority": c.priority,
+                "status": c.status,
+                "ai_summary": c.ai_summary,
+                "triaged_by": c.triaged_by,
+                "triage_latency_ms": c.triage_latency_ms,
+                **(
+                    {"created_at": c.created_at, "updated_at": c.created_at} if c.created_at else {}
+                ),
+            }
+            for c in items
+        ]
+        if not rows:
+            return 0
+        stmt = (
+            insert(ComplaintRow)
+            .values(rows)
+            .on_conflict_do_nothing(index_elements=[ComplaintRow.id])
+            .returning(ComplaintRow.id)
+        )
+        return len(self._s.execute(stmt).all())
 
-    async def list_filtered(
-        self,
-        *,
-        category: Category | None,
-        priority: Priority | None,
-        status: Status | None,
-        page: int,
-        page_size: int,
-    ) -> tuple[list[Complaint], int]:
-        """Returns (items, total_count). page_size must be clamped to <=100 by the
-        caller (route/service), per the API contract (§2.2).
+    def get_for_update(self, complaint_id: uuid.UUID) -> ComplaintRow | None:
+        """Row-lock so two operators cannot both apply a transition from the same state."""
+        stmt = select(ComplaintRow).where(ComplaintRow.id == complaint_id).with_for_update()
+        return self._s.execute(stmt).scalar_one_or_none()
 
-        TODO(you): build the filtered query, apply .offset()/.limit(), and run a
-        separate func.count() query for `total`. This is also where the
-        (status, priority) and created_at indexes (§2.3) should actually get used —
-        make sure your ORDER BY matches the created_at index if you sort by it.
-        """
-        raise NotImplementedError
+    def set_status(self, row: ComplaintRow, status: Status) -> ComplaintRow:
+        row.status = status
+        self._s.flush()  # updated_at is bumped by the complaints_touch_updated_at trigger
+        self._s.refresh(row)
+        return row
 
-    async def update_status(self, complaint_id: uuid.UUID, new_status: Status) -> Complaint | None:
-        # TODO(you): fetch, mutate .status, commit, return updated row (or None if not found).
-        # State-machine legality is validated by the caller BEFORE this is invoked —
-        # this method should not re-implement the transition table.
-        raise NotImplementedError
+    def commit(self) -> None:
+        self._s.commit()
 
-    async def get_stats(self) -> dict:
-        """Aggregate counts by category and priority (§2.2 GET /api/stats).
+    def rollback(self) -> None:
+        self._s.rollback()
 
-        TODO(you): implement with GROUP BY category / GROUP BY priority queries,
-        e.g.:
-            select(Complaint.category, func.count()).group_by(Complaint.category)
-        Shape the return value to match whatever your StatsService/route expects.
-        """
-        raise NotImplementedError
+    # -- reads -------------------------------------------------------------
+    def get(self, complaint_id: uuid.UUID) -> ComplaintRow | None:
+        return self._s.get(ComplaintRow, complaint_id)
+
+    def list(
+        self, flt: ComplaintFilter, page: int, page_size: int
+    ) -> tuple[list[ComplaintRow], int]:
+        conditions = []
+        if flt.category is not None:
+            conditions.append(ComplaintRow.category == flt.category)
+        if flt.priority is not None:
+            conditions.append(ComplaintRow.priority == flt.priority)
+        if flt.status is not None:
+            conditions.append(ComplaintRow.status == flt.status)
+
+        total = self._s.execute(
+            select(func.count()).select_from(ComplaintRow).where(*conditions)
+        ).scalar_one()
+        # Newest first: served by ix_complaints_created_at (backward index scan).
+        items = (
+            self._s.execute(
+                select(ComplaintRow)
+                .where(*conditions)
+                .order_by(ComplaintRow.created_at.desc(), ComplaintRow.id)
+                .limit(page_size)
+                .offset((page - 1) * page_size)
+            )
+            .scalars()
+            .all()
+        )
+        return list(items), int(total)
+
+    def stats(self) -> StatsSnapshot:
+        def grouped(col: object) -> dict[str, int]:
+            rows = self._s.execute(
+                select(col, func.count()).select_from(ComplaintRow).group_by(col)  # type: ignore[call-overload]
+            ).all()
+            return {str(getattr(k, "value", k)): int(n) for k, n in rows}
+
+        by_status = grouped(ComplaintRow.status)
+        return StatsSnapshot(
+            total=sum(by_status.values()),
+            by_category=grouped(ComplaintRow.category),
+            by_priority=grouped(ComplaintRow.priority),
+            by_status=by_status,
+        )
+
+
+def ping_database(engine: Engine) -> bool:
+    """Readiness check. Lives here because it is SQL."""
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return True
+    except Exception:
+        return False

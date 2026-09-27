@@ -1,51 +1,70 @@
+"""SimulatedTriage — the deterministic fake used in CI.
+
+* Seeded: the same (seed, text, location) always gives the same answer.
+* No network, no sleep: "timeout" is injected by raising the timeout error,
+  not by waiting, so tests never depend on wall-clock time.
+* Its output goes through the same `parse_triage_json` validator as a real
+  model, so `malformed` mode exercises the real validation path.
 """
-Deterministic fake provider for CI (§2.5). No network calls, ever — if this
-class imports httpx/openai/redis, that's a bug. Must support configurable
-failure injection so tests can exercise the fallback and validation paths
-without depending on a real, flaky provider.
-"""
+
 from __future__ import annotations
 
-from app.db.models import Category, Priority
+import hashlib
+import json
+import random
+
+from app.domain import TriagedBy
 from app.providers.triage.base import (
-    TriageInvalidOutputError,
-    TriageProvider,
-    TriageTimeoutError,
+    ProviderRateLimitedError,
+    ProviderRequestError,
+    ProviderServerError,
+    ProviderTimeoutError,
+    TriageResult,
+    parse_triage_json,
 )
-from app.schemas.triage import TriageResult
+from app.providers.triage.rules import RuleBasedTriage
+
+_MALFORMED_OUTPUTS = (
+    "Sure! This looks like a water complaint with high priority.",  # prose
+    '```json\n{"category": "water", "priority": "high", "summary": "x", "confidence": 1}\n```',
+    '{"category": "flooding", "priority": "high", "summary": "x", "confidence": 0.9}',  # not in enum
+    '{"category": "water", "priority": "high", "summary": "' + "y" * 400 + '", "confidence": 0.9}',
+)
 
 
-class SimulatedTriage(TriageProvider):
-    name = "simulated"
+class SimulatedTriage:
+    name = TriagedBy.SIMULATED.value
 
-    def __init__(
-        self,
-        *,
-        fail_mode: str | None = None,  # None | "timeout" | "invalid_output" | "raise"
-    ) -> None:
-        self.fail_mode = fail_mode
+    def __init__(self, seed: int = 42, failure_mode: str = "none", failure_rate: float = 0.0):
+        self._seed = seed
+        self._mode = failure_mode
+        self._rate = failure_rate
+        self._rules = RuleBasedTriage()
+
+    def _rng(self, text: str, location: str) -> random.Random:
+        digest = hashlib.sha256(f"{self._seed}|{text}|{location}".encode()).hexdigest()
+        return random.Random(int(digest[:16], 16))
 
     def triage(self, text: str, location: str) -> TriageResult:
-        if self.fail_mode == "timeout":
-            raise TriageTimeoutError("simulated timeout")
-        if self.fail_mode == "invalid_output":
-            raise TriageInvalidOutputError("simulated malformed output")
-        if self.fail_mode == "raise":
-            raise RuntimeError("simulated unexpected failure")
+        rng = self._rng(text, location)
+        if self._mode != "none" and rng.random() < self._rate:
+            if self._mode == "timeout":
+                raise ProviderTimeoutError("simulated timeout")
+            if self._mode == "rate_limit":
+                raise ProviderRateLimitedError("simulated 429")
+            if self._mode == "bad_request":
+                raise ProviderRequestError("simulated 400")
+            if self._mode == "malformed":
+                return parse_triage_json(rng.choice(_MALFORMED_OUTPUTS))
+            raise ProviderServerError("simulated 503")
 
-        # TODO(you): implement deterministic, seeded logic based on `text`/`location`
-        # so tests can assert specific outputs. Keep it simple and predictable —
-        # e.g. hash-based or keyword-based selection, NOT random.
-        return TriageResult(
-            category=Category.OTHER,
-            priority=Priority.NORMAL,
-            summary=text[:140],
-            confidence=1.0,
+        base = self._rules.triage(text, location)
+        raw = json.dumps(
+            {
+                "category": base.category.value,
+                "priority": base.priority.value,
+                "summary": base.summary,
+                "confidence": round(0.8 + rng.random() * 0.2, 2),
+            }
         )
-
-
-# TODO(you): the assignment requires "given a provider that always raises,
-# POST /api/complaints still returns 201 and triaged_by == 'rules:fallback'"
-# (§2.5, "Write this test if you write no other"). Use
-# SimulatedTriage(fail_mode="raise") for exactly that test — see
-# tests/test_triage_fallback.py.
+        return parse_triage_json(raw)
