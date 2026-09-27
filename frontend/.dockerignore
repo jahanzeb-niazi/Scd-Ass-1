@@ -1,0 +1,17 @@
+# Keep the build context to what the image needs. Report before/after sizes in
+# docs/ENGINEERING-NOTES.md (see scripts/context-size.sh).
+.git
+.gitignore
+node_modules
+dist
+coverage
+tests
+*.test.ts
+*.test.tsx
+.env
+.env.*
+Dockerfile
+.dockerignore
+eslint.config.js
+*.md
+.vite

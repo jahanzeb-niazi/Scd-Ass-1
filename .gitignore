@@ -1,3 +1,26 @@
+# --- secrets: never committed (−20 per §5.3) ---
 .env
-*.pem
-*.key
+.env.*
+!.env.example
+
+# --- python ---
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# --- node ---
+node_modules/
+frontend/dist/
+frontend/coverage/
+*.tsbuildinfo
+
+# --- editors / OS ---
+.idea/
+.vscode/
+.DS_Store
