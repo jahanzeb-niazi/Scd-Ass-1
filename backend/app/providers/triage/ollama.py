@@ -1,55 +1,63 @@
+"""OllamaTriage — fully offline path. Same interface, a container in Compose.
+
+No key, no rate limit, and no PII leaves the machine, so no redaction is needed.
+Slower on CPU and weaker at classification: the buy-vs-host trade-off, measured.
 """
-Fully offline triage path — calls a local Ollama container (§2.5). Same
-interface and same non-responsibilities as llm.py: no retry/fallback here,
-that's the orchestrator's job.
-"""
+
 from __future__ import annotations
 
-import json
-
 import httpx
-from pydantic import ValidationError
 
-from app.config import settings
+from app.domain import TriagedBy
 from app.providers.triage.base import (
-    TriageInvalidOutputError,
-    TriageProvider,
-    TriageTimeoutError,
+    ProviderOutputError,
+    ProviderTimeoutError,
+    ProviderUnavailableError,
+    TriageResult,
+    parse_triage_json,
 )
-from app.schemas.triage import TriageResult
-from app.providers.triage.llm import SYSTEM_PROMPT  # reuse the same injection-guardrail prompt
+from app.providers.triage.llm import raise_for_status
+from app.providers.triage.prompt import RESPONSE_JSON_SCHEMA, SYSTEM_INSTRUCTION, build_user_prompt
 
 
-class OllamaTriage(TriageProvider):
-    name = "llm:ollama"
+class OllamaTriage:
+    name = TriagedBy.LLM_OLLAMA.value
+
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        timeout_s: float = 10.0,
+        client: httpx.Client | None = None,
+    ) -> None:
+        self.model = model
+        self._url = f"{base_url.rstrip('/')}/api/chat"
+        self._client = client or httpx.Client(timeout=httpx.Timeout(timeout_s))
 
     def triage(self, text: str, location: str) -> TriageResult:
-        prompt = f"{SYSTEM_PROMPT}\n\n<complaint_text>{text}</complaint_text>\n<location>{location}</location>"
-
+        payload = {
+            "model": self.model,
+            "stream": False,
+            "format": RESPONSE_JSON_SCHEMA,  # Ollama structured outputs
+            "options": {"temperature": 0},
+            "messages": [
+                {"role": "system", "content": SYSTEM_INSTRUCTION},
+                {"role": "user", "content": build_user_prompt(text, location)},
+            ],
+        }
         try:
-            resp = httpx.post(
-                f"{settings.ollama_base_url}/api/generate",
-                json={"model": settings.ollama_model, "prompt": prompt, "stream": False, "format": "json"},
-                timeout=settings.triage_timeout_seconds,
-            )
-            resp.raise_for_status()
+            resp = self._client.post(self._url, json=payload)
         except httpx.TimeoutException as exc:
-            raise TriageTimeoutError(str(exc)) from exc
+            raise ProviderTimeoutError(type(exc).__name__) from exc
         except httpx.HTTPError as exc:
-            raise TriageInvalidOutputError(f"ollama request failed: {exc}") from exc
+            raise ProviderUnavailableError(type(exc).__name__) from exc
 
-        raw = resp.json().get("response", "")
+        raise_for_status(resp.status_code)
         try:
-            data = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise TriageInvalidOutputError(f"non-JSON response: {exc}") from exc
+            raw = resp.json()["message"]["content"]
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ProviderOutputError("no message content in response") from exc
+        return parse_triage_json(raw)
 
-        try:
-            return TriageResult.model_validate(data)
-        except ValidationError as exc:
-            raise TriageInvalidOutputError(f"schema validation failed: {exc}") from exc
-
-
-# TODO(you): §2.5 notes Ollama is "slower on CPU and noticeably worse at
-# classification" — measure this yourself and write the comparison into
-# docs/adr/0001-provider-interface.md as part of the buy-vs-host trade-off.
+    def close(self) -> None:
+        self._client.close()

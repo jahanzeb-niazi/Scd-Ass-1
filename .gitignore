@@ -1,26 +1,26 @@
-# Secrets — never commit
+# --- secrets: never committed (−20 per §5.3) ---
 .env
 .env.*
 !.env.example
 
-# Python
-__pycache__/
-*.pyc
+# --- python ---
 .venv/
+__pycache__/
+*.py[cod]
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-htmlcov/
 .coverage
+coverage.xml
+htmlcov/
 
-# Node
+# --- node ---
 node_modules/
-dist/
-coverage/
+frontend/dist/
+frontend/coverage/
+*.tsbuildinfo
 
-# OS / editor
-.DS_Store
+# --- editors / OS ---
 .idea/
 .vscode/
-
-# Evidence screenshots are tracked intentionally (docs/evidence/) — do not ignore that dir
+.DS_Store

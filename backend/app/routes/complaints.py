@@ -1,95 +1,116 @@
-"""
-HTTP layer only — parse, validate, serialize, status codes. No business rules
-(§2.2: "A route that opens a database session is a design failure worth marks" —
-same applies to embedding logic here instead of in services/).
+"""/api/complaints — HTTP only: parse, validate, call a service, serialise."""
 
-Endpoints, verbatim from §2.2:
-  POST   /api/complaints              -> 201 / 400 / 429
-  GET    /api/complaints/{id}         -> 200 / 404
-  GET    /api/complaints              -> filter + paginate, returns total
-  PATCH  /api/complaints/{id}/status  -> enforce state machine, 409 on invalid
-"""
 from __future__ import annotations
 
 import uuid
+from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request, Response, status
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Depends, Query, Response, status
 
-from app.db.models import Category, Priority, Status
-from app.schemas.complaint import ComplaintCreate, ComplaintList, ComplaintOut, StatusUpdate
+from app.deps import client_ip, get_complaint_service, get_rate_limit_service
+from app.domain import Category, Priority, Status
+from app.repositories.complaint_repository import ComplaintFilter
+from app.routes.errors import RateLimitExceededError
+from app.routes.schemas import (
+    ComplaintCreate,
+    ComplaintCreated,
+    ComplaintOut,
+    ComplaintPage,
+    ErrorOut,
+    RateLimitErrorOut,
+    StatusUpdate,
+    TransitionErrorOut,
+    TriageInfo,
+    ValidationErrorOut,
+)
 from app.services.complaint_service import ComplaintService
-from app.services.state_machine import InvalidTransitionError
+from app.services.rate_limit_service import RateLimitService
 
 router = APIRouter(prefix="/api/complaints", tags=["complaints"])
 
 
-def get_complaint_service() -> ComplaintService:
-    # TODO(you): wire real dependency injection (repository + orchestrator built
-    # from the configured provider via app/providers/triage/factory.py)
-    raise NotImplementedError
+def enforce_rate_limit(
+    response: Response,
+    ip: str = Depends(client_ip),
+    limiter: RateLimitService = Depends(get_rate_limit_service),
+) -> None:
+    decision = limiter.check_submission(ip)
+    if not decision.allowed:
+        raise RateLimitExceededError(decision.retry_after_s, decision.limit)
+    response.headers["X-RateLimit-Limit"] = str(decision.limit)
+    response.headers["X-RateLimit-Remaining"] = str(decision.remaining)
 
 
-@router.post("", status_code=status.HTTP_201_CREATED, response_model=ComplaintOut)
-async def create_complaint(
-    payload: ComplaintCreate,
-    request: Request,
-    service: ComplaintService = Depends(get_complaint_service),
-):
-    """
-    TODO(you):
-      1. Check the distributed rate limiter (app/providers/rate_limiter) keyed
-         on request.client.host; on RateLimitExceeded return 429 with a
-         Retry-After header (use a Response/JSONResponse, not just raise).
-      2. await service.submit_complaint(text=payload.text, location=payload.location,
-         reporter_contact=payload.reporter_contact)
-      3. Return the created complaint (FastAPI serializes via response_model).
-    Pydantic already handles the 400 field-validation case via ComplaintCreate's
-    constraints — you don't need to hand-roll that, but confirm the error body
-    shape matches what §2.2 calls a "field-level error body".
-    """
-    raise NotImplementedError
+@router.post(
+    "",
+    status_code=status.HTTP_201_CREATED,
+    response_model=ComplaintCreated,
+    dependencies=[Depends(enforce_rate_limit)],
+    responses={
+        400: {"model": ValidationErrorOut, "description": "Field-level validation errors"},
+        429: {"model": RateLimitErrorOut, "description": "Rate limit exceeded; see Retry-After"},
+    },
+)
+def submit_complaint(
+    body: ComplaintCreate,
+    response: Response,
+    svc: ComplaintService = Depends(get_complaint_service),
+) -> ComplaintCreated:
+    result = svc.submit(body.text, body.location, body.reporter_contact)
+    response.headers["Location"] = f"/api/complaints/{result.complaint.id}"
+    return ComplaintCreated(
+        **ComplaintOut.model_validate(result.complaint).model_dump(),
+        triage=TriageInfo(
+            confidence=result.confidence, cache_hit=result.cache_hit, fallback=result.fallback
+        ),
+    )
 
 
-@router.get("/{complaint_id}", response_model=ComplaintOut)
-async def get_complaint(
-    complaint_id: uuid.UUID,
-    service: ComplaintService = Depends(get_complaint_service),
-):
-    # TODO(you): fetch via service; if None, raise HTTPException(404)
-    raise NotImplementedError
-
-
-@router.get("", response_model=ComplaintList)
-async def list_complaints(
+@router.get(
+    "",
+    response_model=ComplaintPage,
+    responses={400: {"model": ValidationErrorOut}},
+)
+def list_complaints(
+    svc: ComplaintService = Depends(get_complaint_service),
     category: Category | None = None,
     priority: Priority | None = None,
-    status_filter: Status | None = None,
-    page: int = 1,
-    page_size: int = 20,
-    service: ComplaintService = Depends(get_complaint_service),
-):
-    # TODO(you): clamp page_size to <=100 (§2.2), call service.list_complaints,
-    # wrap into ComplaintList(items=..., total=..., page=..., page_size=...)
-    raise NotImplementedError
+    status_: Annotated[Status | None, Query(alias="status")] = None,
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+) -> ComplaintPage:
+    result = svc.list(ComplaintFilter(category, priority, status_), page, page_size)
+    return ComplaintPage(
+        items=[ComplaintOut.model_validate(v) for v in result.items],
+        total=result.total,
+        page=result.page,
+        page_size=result.page_size,
+    )
 
 
-@router.patch("/{complaint_id}/status", response_model=ComplaintOut)
-async def update_status(
+@router.get(
+    "/{complaint_id}",
+    response_model=ComplaintOut,
+    responses={404: {"model": ErrorOut}, 400: {"model": ValidationErrorOut}},
+)
+def get_complaint(
+    complaint_id: uuid.UUID, svc: ComplaintService = Depends(get_complaint_service)
+) -> ComplaintOut:
+    return ComplaintOut.model_validate(svc.get(complaint_id))
+
+
+@router.patch(
+    "/{complaint_id}/status",
+    response_model=ComplaintOut,
+    responses={
+        400: {"model": ValidationErrorOut},
+        404: {"model": ErrorOut},
+        409: {"model": TransitionErrorOut, "description": "Transition not allowed"},
+    },
+)
+def change_status(
     complaint_id: uuid.UUID,
-    payload: StatusUpdate,
-    service: ComplaintService = Depends(get_complaint_service),
-):
-    """
-    TODO(you): call service.update_status; catch InvalidTransitionError and
-    return a 409 whose body names the attempted transition, e.g.:
-
-        try:
-            return await service.update_status(complaint_id, payload.status)
-        except InvalidTransitionError as exc:
-            return JSONResponse(
-                status_code=409,
-                content={"error": f"cannot transition from {exc.current.value} to {exc.attempted.value}"},
-            )
-    """
-    raise NotImplementedError
+    body: StatusUpdate,
+    svc: ComplaintService = Depends(get_complaint_service),
+) -> ComplaintOut:
+    return ComplaintOut.model_validate(svc.change_status(complaint_id, body.status))

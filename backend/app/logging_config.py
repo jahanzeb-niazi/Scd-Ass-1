@@ -1,44 +1,59 @@
+"""Structured JSON logging to stdout, with a request_id on every line.
+
+Containers have ephemeral filesystems and log shippers read stdout, so there is
+no file handler anywhere in this service.
 """
-Structured JSON logging to stdout (§2.2: "never to a file, because a container's
-filesystem is ephemeral"). request_id is injected via contextvars so every log
-line inside a request carries it, propagated from the X-Request-ID header
-(middleware.py generates one if absent).
-"""
+
 from __future__ import annotations
 
+import json
 import logging
 import sys
 from contextvars import ContextVar
+from datetime import UTC, datetime
+from typing import Any
 
-from pythonjsonlogger import jsonlogger
+request_id_var: ContextVar[str] = ContextVar("request_id", default="-")
 
-request_id_ctx: ContextVar[str] = ContextVar("request_id", default="-")
+# Attributes every LogRecord has; anything else was passed via `extra=` and is emitted.
+_RESERVED = set(vars(logging.makeLogRecord({}))) | {
+    "message",
+    "asctime",
+    "taskName",
+    "color_message",
+}
 
 
-class RequestIdFilter(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        record.request_id = request_id_ctx.get()
-        return True
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict[str, Any] = {
+            "ts": datetime.fromtimestamp(record.created, tz=UTC).isoformat(timespec="milliseconds"),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "request_id": request_id_var.get(),
+        }
+        for key, value in vars(record).items():
+            if key not in _RESERVED and not key.startswith("_"):
+                payload[key] = value
+        if record.exc_info:
+            payload["exc_type"] = record.exc_info[0].__name__ if record.exc_info[0] else None
+            payload["exc"] = self.formatException(record.exc_info)
+        return json.dumps(payload, default=str, ensure_ascii=False)
 
 
-def configure_logging(level: int = logging.INFO) -> None:
+def configure_logging(level: str = "INFO") -> None:
     handler = logging.StreamHandler(sys.stdout)
-    formatter = jsonlogger.JsonFormatter(
-        "%(asctime)s %(levelname)s %(name)s %(request_id)s %(message)s"
-    )
-    handler.setFormatter(formatter)
-    handler.addFilter(RequestIdFilter())
-
+    handler.setFormatter(JsonFormatter())
     root = logging.getLogger()
-    root.handlers = [handler]
-    root.setLevel(level)
-
-
-# TODO(you): make sure every triage fallback logs exactly one WARNING with
-# complaint id, provider name, and error class (§2.2). Example:
-#
-#   logger.warning(
-#       "triage_fallback",
-#       extra={"complaint_id": str(complaint_id), "provider": provider.name,
-#              "error_class": type(exc).__name__},
-#   )
+    root.handlers[:] = [handler]
+    root.setLevel(level.upper())
+    # Route uvicorn's own loggers through the same JSON handler; our middleware
+    # writes the access log (with request_id), so uvicorn's is silenced.
+    for name in ("uvicorn", "uvicorn.error"):
+        lg = logging.getLogger(name)
+        lg.handlers.clear()
+        lg.propagate = True
+    logging.getLogger("uvicorn.access").disabled = True
+    # httpx logs full request lines at INFO; keep them out of the stream.
+    logging.getLogger("httpx").setLevel(logging.WARNING)

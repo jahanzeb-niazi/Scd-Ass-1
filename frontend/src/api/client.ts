@@ -1,84 +1,117 @@
-import { config } from "../config";
-import type {
-  ComplaintCreate,
-  ComplaintList,
-  ComplaintOut,
-  ComplaintStatus,
-  ProviderMeta,
-  StatsResponse,
-} from "./types";
+/**
+ * Typed API client. Every request/response type comes from `schema.d.ts`,
+ * which is generated from the backend's OpenAPI document (`npm run gen:api`)
+ * and checked in CI (`npm run check:api`), so a backend contract change that
+ * the frontend has not absorbed fails the build.
+ *
+ * All calls use the relative path /api — see ADR 0002. There is no backend URL
+ * anywhere in this bundle, and no secrets: anything shipped to a browser is public.
+ */
+import createClient from "openapi-fetch";
+import type { components, paths } from "./schema";
 
+type Schemas = components["schemas"];
+export type Category = Schemas["Category"];
+export type Priority = Schemas["Priority"];
+export type Status = Schemas["Status"];
+export type TriagedBy = Schemas["TriagedBy"];
+export type Complaint = Schemas["ComplaintOut"];
+export type ComplaintCreated = Schemas["ComplaintCreated"];
+export type ComplaintCreate = Schemas["ComplaintCreate"];
+export type ComplaintPage = Schemas["ComplaintPage"];
+export type Stats = Schemas["StatsOut"];
+export type Providers = Schemas["ProvidersOut"];
+export type FieldError = Schemas["FieldErrorOut"];
+
+export type ListQuery = NonNullable<
+  paths["/api/complaints"]["get"]["parameters"]["query"]
+>;
+
+const client = createClient<paths>({
+  // Same-origin in every environment; window.location.origin keeps Request()
+  // happy in test environments that need an absolute URL.
+  baseUrl: typeof window !== "undefined" ? window.location.origin : "",
+  // Resolve fetch lazily so tests can stub it.
+  fetch: (request: Request) => globalThis.fetch(request),
+});
+
+/** An error the server described. `message` is the server's own `detail`, verbatim. */
 export class ApiError extends Error {
+  readonly status: number;
+  readonly fieldErrors: FieldError[];
+  readonly retryAfterS: number | null;
+  readonly requestId: string | null;
+
   constructor(
-    public status: number,
-    public body: unknown,
+    status: number,
+    message: string,
+    opts: { fieldErrors?: FieldError[]; retryAfterS?: number | null; requestId?: string | null } = {},
   ) {
-    super(`API error ${status}`);
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.fieldErrors = opts.fieldErrors ?? [];
+    this.retryAfterS = opts.retryAfterS ?? null;
+    this.requestId = opts.requestId ?? null;
   }
 }
 
-/** Thrown specifically for 429s so the UI can show Retry-After (§2.1 honest loading/error states). */
-export class RateLimitedError extends ApiError {
-  constructor(status: number, body: unknown, public retryAfterSeconds: number | null) {
-    super(status, body);
-  }
-}
-
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const resp = await fetch(`${config.apiBaseUrl}${path}`, {
-    headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
-    ...init,
+function toApiError(response: Response, error: unknown): ApiError {
+  const body = (error ?? {}) as {
+    detail?: unknown;
+    errors?: FieldError[];
+    request_id?: string | null;
+  };
+  const detail =
+    typeof body.detail === "string" && body.detail
+      ? body.detail
+      : `Request failed (HTTP ${response.status})`;
+  const retryAfter = response.headers.get("Retry-After");
+  return new ApiError(response.status, detail, {
+    fieldErrors: Array.isArray(body.errors) ? body.errors : [],
+    retryAfterS: retryAfter !== null && retryAfter !== "" ? Number(retryAfter) : null,
+    requestId: body.request_id ?? response.headers.get("X-Request-ID"),
   });
-
-  if (resp.status === 429) {
-    const retryAfter = resp.headers.get("Retry-After");
-    const body = await resp.json().catch(() => null);
-    throw new RateLimitedError(429, body, retryAfter ? Number(retryAfter) : null);
-  }
-
-  if (!resp.ok) {
-    const body = await resp.json().catch(() => null);
-    throw new ApiError(resp.status, body);
-  }
-
-  // TODO(you): for stats specifically you'll also want the X-Cache header —
-  // consider a separate function that returns { data, cacheStatus } instead
-  // of reusing this generic `request` for GET /api/stats.
-  return resp.json() as Promise<T>;
 }
 
-export const api = {
-  createComplaint: (payload: ComplaintCreate) =>
-    request<ComplaintOut>("/complaints", { method: "POST", body: JSON.stringify(payload) }),
+async function unwrap<T>(
+  call: Promise<{ data?: T; error?: unknown; response: Response }>,
+): Promise<{ data: T; response: Response }> {
+  let result: { data?: T; error?: unknown; response: Response };
+  try {
+    result = await call;
+  } catch {
+    throw new ApiError(0, "Could not reach the CivicPulse API. Check your connection and try again.");
+  }
+  const { data, error, response } = result;
+  if (!response.ok || data === undefined) throw toApiError(response, error);
+  return { data, response };
+}
 
-  getComplaint: (id: string) => request<ComplaintOut>(`/complaints/${id}`),
+export async function submitComplaint(body: ComplaintCreate): Promise<ComplaintCreated> {
+  return (await unwrap(client.POST("/api/complaints", { body }))).data;
+}
 
-  listComplaints: (params: {
-    category?: string;
-    priority?: string;
-    status?: string;
-    page?: number;
-    page_size?: number;
-  }) => {
-    const qs = new URLSearchParams(
-      Object.entries(params).filter(([, v]) => v !== undefined) as [string, string][],
-    );
-    return request<ComplaintList>(`/complaints?${qs.toString()}`);
-  },
+export async function listComplaints(query: ListQuery): Promise<ComplaintPage> {
+  return (await unwrap(client.GET("/api/complaints", { params: { query } }))).data;
+}
 
-  updateStatus: (id: string, status: ComplaintStatus) =>
-    // TODO(you): a 409 here needs special handling in the caller — the spec
-    // requires surfacing the server's exact message (§2.1: "must surface the
-    // server's 409 message, not a generic 'error'"). ApiError.body should
-    // carry that message through; render it verbatim in the Dashboard view.
-    request<ComplaintOut>(`/complaints/${id}/status`, {
-      method: "PATCH",
-      body: JSON.stringify({ status }),
-    }),
+export async function changeStatus(id: string, status: Status): Promise<Complaint> {
+  const call = client.PATCH("/api/complaints/{complaint_id}/status", {
+    params: { path: { complaint_id: id } },
+    body: { status },
+  });
+  return (await unwrap(call)).data;
+}
 
-  // TODO(you): implement getStats to also surface the X-Cache header value
-  // (see note above) — the Stats view must display cache hit/miss (§2.1).
-  getStats: () => request<StatsResponse>("/stats"),
+export type CacheState = "HIT" | "MISS" | null;
 
-  getProviderMeta: () => request<ProviderMeta>("/meta/providers"),
-};
+export async function getStats(): Promise<{ stats: Stats; cache: CacheState }> {
+  const { data, response } = await unwrap(client.GET("/api/stats"));
+  const header = response.headers.get("X-Cache")?.toUpperCase();
+  return { stats: data, cache: header === "HIT" || header === "MISS" ? header : null };
+}
+
+export async function getProviders(): Promise<Providers> {
+  return (await unwrap(client.GET("/api/meta/providers"))).data;
+}

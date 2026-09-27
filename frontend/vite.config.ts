@@ -1,17 +1,30 @@
-import { defineConfig } from "vite";
+/// <reference types="vitest/config" />
 import react from "@vitejs/plugin-react";
+import { defineConfig } from "vite";
+
+// Runtime configuration (ADR 0002): the app only ever calls the relative path
+// /api. In production nginx proxies /api to the backend; in development the
+// Vite dev server does the same. No backend URL is baked into the bundle.
+// API_PROXY_TARGET is read by the dev server only (Node side), never by the bundle.
+const apiTarget = process.env.API_PROXY_TARGET ?? "http://localhost:8000";
 
 export default defineConfig({
   plugins: [react()],
   server: {
-    // TODO(you): decide dev-time proxying to the backend here if you go the
-    // "nginx/vite proxies /api" route for runtime config (see
-    // docs/adr/0002-frontend-runtime-config.md and src/config.ts).
-    // proxy: { "/api": "http://localhost:8000" },
+    port: 5173,
+    proxy: {
+      "/api": { target: apiTarget, changeOrigin: false },
+    },
+  },
+  build: {
+    sourcemap: false,
+    outDir: "dist",
   },
   test: {
     environment: "jsdom",
-    globals: true,
-    setupFiles: [],
+    setupFiles: ["./tests/setup.ts"],
+    include: ["tests/**/*.test.{ts,tsx}"],
+    restoreMocks: true,
+    css: false,
   },
 });

@@ -1,76 +1,101 @@
 # CivicPulse
 
-TODO(you): one-line pitch + badges (CI status, license, etc.) — see §J of the
-rubric: "README.md: problem statement, badges, Mermaid architecture diagram,
-working one-command quickstart, API table, screenshots".
+Municipal complaint intake, AI triage and operations. A citizen describes a problem in their
+own words; the system classifies it into a category, a priority and a one-line summary with
+an LLM, stores it durably, and puts it on an operator dashboard — and keeps working when the
+LLM is slow, rate-limited or wrong.
 
-## Problem
-
-TODO(you): 2-3 sentences in your own words — see assignment §1.1 for the
-framing, but don't just paste it.
-
-## Architecture
-
-TODO(you): embed a Mermaid diagram here, e.g.:
+> **Status:** backend and frontend complete and tested. Docker/Compose, Kubernetes and CI/CD
+> (rubric sections G–I) are the next phase.
 
 ```mermaid
-flowchart TD
-    Citizen -->|HTTP| Frontend[React + Vite, nginx]
-    Frontend -->|/api proxied| Backend[FastAPI + Pydantic]
-    Backend --> Postgres[(PostgreSQL 16)]
-    Backend --> Redis[(Redis 7 — cache + rate limiter)]
-    Backend --> TriageProvider{TriageProvider}
-    TriageProvider -->|default| LLM[Groq / Gemini]
-    TriageProvider -->|CI| Simulated[SimulatedTriage]
-    LLM -->|timeout / 429 / bad JSON| Rules[RuleBasedTriage fallback]
+flowchart LR
+  U[Citizen / Operator] -->|HTTP| FE[frontend<br/>React + Vite → nginx]
+  FE -->|/api proxied| BE[backend<br/>FastAPI + Pydantic]
+  BE --> PG[(PostgreSQL 16)]
+  BE --> RD[(Redis 7<br/>cache + rate limiter)]
+  BE --> TP{{TriageProvider}}
+  TP -->|default| LLM[Gemini · JSON mode]
+  TP -->|CI| SIM[SimulatedTriage]
+  LLM -. timeout · 429 · bad JSON .-> RB[RuleBasedTriage · fallback]
 ```
 
-Redraw this to match what you actually built, not the spec's original diagram.
+## Run it locally (without Docker, for now)
 
-## Quickstart
+Prerequisites: Python 3.12, Node 22, a PostgreSQL 16 and a Redis 7 you can reach.
 
 ```bash
-cp .env.example .env
-# TODO(you): fill in real values in .env
-docker compose up -d --build
+cp .env.example .env            # then edit; GEMINI_API_KEY may stay empty
+
+# --- backend ---
+cd backend
+python -m venv .venv && . .venv/bin/activate
+pip install -r requirements-dev.txt
+export DATABASE_URL=postgresql://civicpulse:change-me@localhost:5432/civicpulse
+export REDIS_URL=redis://localhost:6379/0
+alembic upgrade head            # schema is owned by migrations, never by app startup
+python -m app.seed              # 33 complaints; safe to run again (inserts 0)
+python -m app                   # http://localhost:8000  ·  docs at /docs
+
+# --- frontend (second terminal) ---
+cd frontend
+npm ci
+npm run dev                     # http://localhost:5173  (proxies /api → :8000)
 ```
 
-TODO(you): once this actually works end-to-end, add the URLs (frontend,
-backend docs at /docs, etc.) and confirm this quickstart works from a
-genuinely clean clone before submitting (§5.3: broken quickstart is -5).
+With no `GEMINI_API_KEY`, every complaint is triaged by `rules:fallback` — visible on the
+Stats page and at `/api/meta/providers`. Nothing returns a 500.
+
+## Checks
+
+```bash
+# backend (tests need a PostgreSQL; set TEST_DATABASE_URL, default …/civicpulse_test)
+cd backend && ruff check . && ruff format --check . && mypy && pytest --cov
+
+# frontend
+cd frontend && npm run lint && npm run typecheck && npm test && npm run build
+npm run check:api               # typed client still matches backend/openapi.json
+```
+
+Regenerate the typed client after changing the API:
+`cd backend && python -m app.export_openapi > openapi.json && cd ../frontend && npm run gen:api`
 
 ## API
 
-| Method | Path | Behavior |
+| Method | Path | Behaviour |
 |---|---|---|
-| POST | /api/complaints | Validate → triage → persist. 201 / 400 / 429 |
-| GET | /api/complaints/{id} | 200 / 404 |
-| GET | /api/complaints | Filter + paginate, returns total |
-| PATCH | /api/complaints/{id}/status | Enforce state machine, 409 on invalid |
-| GET | /api/stats | Aggregates, Redis-cached, X-Cache header |
-| GET | /api/meta/providers | Active provider + last 20 triage outcomes |
-| GET | /health | Liveness — never touches the database |
-| GET | /ready | Readiness — Postgres + Redis reachability |
-| GET | /metrics | Prometheus text format |
+| POST | `/api/complaints` | Validate → triage → persist. **201**; **400** field-level errors; **429** + `Retry-After` (10/min/IP, Redis). |
+| GET | `/api/complaints/{id}` | **200** / **404** (bad UUID → 400). |
+| GET | `/api/complaints` | Filters `category`, `priority`, `status`; `page`, `page_size ≤ 100`; returns `total`. Newest first. |
+| PATCH | `/api/complaints/{id}/status` | State machine; invalid → **409** naming the transition. |
+| GET | `/api/stats` | Counts by category/priority/status. Redis, TTL 30 s, invalidated on write. `X-Cache: HIT\|MISS`. |
+| GET | `/api/meta/providers` | Active provider, model, triage-cache hit rate, last 20 outcomes. |
+| GET | `/health` | Liveness. Touches nothing external. |
+| GET | `/ready` | Readiness. 200 only if Postgres **and** Redis reachable (and not draining); 503 names the failure. |
+| GET | `/metrics` | Prometheus: requests, latency histogram, triage latency, fallback counter. |
 
-## Screenshots
+Status machine: `open → in_progress → resolved`, `open → rejected`, `in_progress → rejected`;
+`resolved` and `rejected` are terminal. Every complaint response carries
+`allowed_transitions`, so the frontend never duplicates the table.
 
-TODO(you): add screenshots of the three frontend views once built.
+## Layout
 
-## Tech stack
+```
+backend/app/
+  routes/        HTTP only — parse, validate, serialise, status codes
+  services/      business rules — triage policy, state machine, stats, rate-limit policy
+  repositories/  persistence — all SQL lives here
+  providers/     outbound integrations behind interfaces — triage/, cache, rate limiter
+  container.py   composition root;  deps.py  per-request wiring (routes never see a session)
+frontend/src/
+  api/           generated schema.d.ts + typed client
+  pages/         Submit, Dashboard, Stats
+  components/    ErrorBoundary, badges, spinner
+```
 
-- Backend: FastAPI + Pydantic v2, SQLAlchemy (async), Alembic
-- Frontend: React 18 + Vite + TypeScript, served by nginx
-- Data: PostgreSQL 16, Redis 7
-- Infra: Docker Compose (dev/prod), Kubernetes (Kustomize base + overlays), GitHub Actions
+## Decisions
 
-## Docs
-
-- [Engineering Notes](docs/ENGINEERING-NOTES.md)
-- [Runbook](docs/RUNBOOK.md)
-- [AI Usage](docs/AI-USAGE.md)
-- [ADRs](docs/adr/)
-
-## License
-
-TODO(you): add a LICENSE file and reference it here if your course requires one.
+- [ADR 0001 — Triage behind a provider interface (Gemini)](docs/adr/0001-provider-interface.md)
+- [ADR 0002 — Frontend runtime config: nginx proxies `/api`](docs/adr/0002-frontend-runtime-config.md)
+- ADR 0003 — Deploy by SHA *(CI/CD phase)*
+- [ADR 0004 — PII: body-only, redacted, never the contact](docs/adr/0004-pii-and-data-governance.md)

@@ -1,71 +1,111 @@
+"""Redis-backed cache provider (job 1: read-through cache; also triage cache,
+hit-rate counters and the recent-outcomes ring buffer).
+
+Services depend on the `Cache` protocol, so tests can pass fakeredis or a stub.
+All Redis failures surface as `CacheError`; callers decide whether to degrade.
 """
-Redis-backed cache provider. Serves TWO purposes deliberately (§2.4):
-  1. Read-through cache for /api/stats (TTL 30s, invalidate on write)
-  2. Content-hash cache for triage results (TTL 24h, §2.5 item 5)
-Both go through this one class so the "infrastructure is a capability, not a
-single-purpose box" point is visible in one place.
-"""
+
 from __future__ import annotations
 
-import hashlib
-import json
+from typing import Protocol, cast
 
-import redis.asyncio as redis
-
-from app.config import settings
-
-_client: redis.Redis | None = None
+import redis
+from redis.backoff import ConstantBackoff
+from redis.retry import Retry
 
 
-def get_redis() -> redis.Redis:
-    global _client
-    if _client is None:
-        _client = redis.from_url(settings.redis_url, decode_responses=True)
-    return _client
+class CacheError(Exception):
+    pass
 
 
-# --- Stats cache (§2.4 Job 1) ---
+def build_redis_client(url: str, timeout_s: float) -> redis.Redis:
+    """One Redis client for cache and rate limiter.
 
-STATS_CACHE_KEY = "stats:aggregate"
-
-
-async def get_cached_stats() -> tuple[str | None, bool]:
-    """Returns (json_string_or_None, was_hit)."""
-    client = get_redis()
-    value = await client.get(STATS_CACHE_KEY)
-    return value, value is not None
-
-
-async def set_cached_stats(payload: dict) -> None:
-    client = get_redis()
-    await client.set(STATS_CACHE_KEY, json.dumps(payload), ex=settings.stats_cache_ttl_seconds)
-
-
-async def invalidate_stats_cache() -> None:
-    """Call this on every complaint write — do NOT rely on TTL alone (§2.4:
-    'Invalidate on write, so a newly submitted complaint appears in the stats
-    immediately rather than up to 30 seconds later')."""
-    client = get_redis()
-    await client.delete(STATS_CACHE_KEY)
+    redis-py's default retry policy backs off several times per command. During
+    a Redis outage that turns every request into a multi-second wait, so we
+    allow a single quick retry and then let the caller degrade.
+    """
+    return redis.Redis.from_url(
+        url,
+        decode_responses=True,
+        socket_timeout=timeout_s,
+        socket_connect_timeout=timeout_s,
+        health_check_interval=30,
+        retry=Retry(ConstantBackoff(0.05), retries=1),
+    )
 
 
-# --- Triage content-hash cache (§2.5 item 5) ---
-
-def _content_hash(text: str, location: str) -> str:
-    return hashlib.sha256(f"{text}|{location}".encode()).hexdigest()
-
-
-async def get_cached_triage(text: str, location: str) -> str | None:
-    client = get_redis()
-    return await client.get(f"triage:{_content_hash(text, location)}")
-
-
-async def set_cached_triage(text: str, location: str, result_json: str) -> None:
-    client = get_redis()
-    key = f"triage:{_content_hash(text, location)}"
-    await client.set(key, result_json, ex=settings.triage_cache_ttl_seconds)
+class Cache(Protocol):
+    def get(self, key: str) -> str | None: ...
+    def set(self, key: str, value: str, ttl_s: int) -> None: ...
+    def delete(self, *keys: str) -> None: ...
+    def incr(self, key: str) -> int: ...
+    def get_int(self, key: str) -> int: ...
+    def push_capped(self, key: str, value: str, maxlen: int) -> None: ...
+    def list_range(self, key: str, count: int) -> list[str]: ...
+    def ping(self) -> bool: ...
 
 
-# TODO(you): track a hit/miss counter for the triage cache so you can report a
-# measured hit rate (§2.5 item 5, rubric item F: "measured, reported hit rate").
-# A simple Redis INCR on hit and on miss, read back for the report, is enough.
+class RedisCache:
+    def __init__(self, client: redis.Redis) -> None:
+        self._r = client
+
+    @classmethod
+    def from_url(cls, url: str, timeout_s: float) -> RedisCache:
+        return cls(build_redis_client(url, timeout_s))
+
+    @property
+    def client(self) -> redis.Redis:
+        return self._r
+
+    def get(self, key: str) -> str | None:
+        try:
+            return cast("str | None", self._r.get(key))
+        except redis.RedisError as exc:
+            raise CacheError(type(exc).__name__) from exc
+
+    def set(self, key: str, value: str, ttl_s: int) -> None:
+        try:
+            self._r.set(key, value, ex=ttl_s)
+        except redis.RedisError as exc:
+            raise CacheError(type(exc).__name__) from exc
+
+    def delete(self, *keys: str) -> None:
+        try:
+            self._r.delete(*keys)
+        except redis.RedisError as exc:
+            raise CacheError(type(exc).__name__) from exc
+
+    def incr(self, key: str) -> int:
+        try:
+            return int(self._r.incr(key))
+        except redis.RedisError as exc:
+            raise CacheError(type(exc).__name__) from exc
+
+    def get_int(self, key: str) -> int:
+        value = self.get(key)
+        return int(value) if value else 0
+
+    def push_capped(self, key: str, value: str, maxlen: int) -> None:
+        try:
+            pipe = self._r.pipeline(transaction=True)
+            pipe.lpush(key, value)
+            pipe.ltrim(key, 0, maxlen - 1)
+            pipe.execute()
+        except redis.RedisError as exc:
+            raise CacheError(type(exc).__name__) from exc
+
+    def list_range(self, key: str, count: int) -> list[str]:
+        try:
+            return cast("list[str]", self._r.lrange(key, 0, count - 1))
+        except redis.RedisError as exc:
+            raise CacheError(type(exc).__name__) from exc
+
+    def ping(self) -> bool:
+        try:
+            return bool(self._r.ping())
+        except redis.RedisError:
+            return False
+
+    def close(self) -> None:
+        self._r.close()
