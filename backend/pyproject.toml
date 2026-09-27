@@ -1,0 +1,54 @@
+[project]
+name = "civicpulse-backend"
+version = "0.1.0"
+description = "CivicPulse — municipal complaint intake, triage and operations API"
+requires-python = ">=3.11"
+# Dependencies are pinned in requirements.txt / requirements-dev.txt so the
+# Dockerfile can install them in a cache-friendly layer before the source.
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["alembic/versions"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "SIM", "RUF"]
+ignore = [
+    "S101",   # assert is fine in tests
+    "S311",   # random is used for jitter/simulation, not crypto
+    "B008",   # FastAPI Depends() in defaults is idiomatic
+    "RUF001", # arrows/en-dashes in user-facing strings are intentional
+    "RUF002",
+    "RUF003",
+    "E501",   # `ruff format` owns line length; long user-facing strings stay unbroken
+]
+
+[tool.ruff.lint.isort]
+known-third-party = ["alembic"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S105", "S106"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+plugins = ["pydantic.mypy"]
+files = ["app"]
+
+[[tool.mypy.overrides]]
+module = ["fakeredis.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = ["db: needs a real PostgreSQL (TEST_DATABASE_URL)"]
+
+[tool.coverage.run]
+source = ["app"]
+omit = ["app/__main__.py"]
+
+[tool.coverage.report]
+fail_under = 65
+show_missing = true
+skip_covered = true
