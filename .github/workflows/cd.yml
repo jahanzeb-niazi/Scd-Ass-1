@@ -1,0 +1,225 @@
+name: CD
+
+on:
+  push:
+    branches: [main]
+
+# Default for every job: read-only. Jobs that publish or sign widen it explicitly.
+permissions:
+  contents: read
+
+concurrency:
+  group: cd-main
+  cancel-in-progress: false   # never cancel a deploy half-way
+
+env:
+  KUSTOMIZE_VERSION: "5.8.1"
+  K3D_CLUSTER: civicpulse-ci
+
+jobs:
+  # The full CI suite again, on the merged result.
+  test:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  build-push:
+    name: build-push
+    needs: test                  # never publish code we already know is broken
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write            # push to GHCR with the scoped GITHUB_TOKEN
+      id-token: write            # keyless Cosign signing (OIDC)
+    outputs:
+      repo: ${{ steps.repo.outputs.repo }}
+      backend_digest: ${{ steps.backend.outputs.digest }}
+      frontend_digest: ${{ steps.frontend.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: repo
+        name: Image repository (GHCR requires lower case)
+        run: echo "repo=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build + push backend (tags ${{ github.sha }} and latest)
+        id: backend
+        uses: docker/build-push-action@v7
+        with:
+          context: backend
+          push: true
+          build-args: GIT_SHA=${{ github.sha }}
+          tags: |
+            ${{ steps.repo.outputs.repo }}/civicpulse-backend:${{ github.sha }}
+            ${{ steps.repo.outputs.repo }}/civicpulse-backend:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+
+      - name: Build + push frontend (tags ${{ github.sha }} and latest)
+        id: frontend
+        uses: docker/build-push-action@v7
+        with:
+          context: frontend
+          push: true
+          build-args: GIT_SHA=${{ github.sha }}
+          tags: |
+            ${{ steps.repo.outputs.repo }}/civicpulse-frontend:${{ github.sha }}
+            ${{ steps.repo.outputs.repo }}/civicpulse-frontend:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend
+
+      - name: SBOM (Syft) — backend
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.repo.outputs.repo }}/civicpulse-backend@${{ steps.backend.outputs.digest }}
+          format: spdx-json
+          artifact-name: sbom-backend.spdx.json
+      - name: SBOM (Syft) — frontend
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.repo.outputs.repo }}/civicpulse-frontend@${{ steps.frontend.outputs.digest }}
+          format: spdx-json
+          artifact-name: sbom-frontend.spdx.json
+
+      - uses: sigstore/cosign-installer@v4.1.2
+      - name: Cosign sign (keyless) — by digest
+        env:
+          REPO: ${{ steps.repo.outputs.repo }}
+          BACKEND: ${{ steps.backend.outputs.digest }}
+          FRONTEND: ${{ steps.frontend.outputs.digest }}
+        run: |
+          cosign sign --yes "${REPO}/civicpulse-backend@${BACKEND}"
+          cosign sign --yes "${REPO}/civicpulse-frontend@${FRONTEND}"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Published"
+            echo "| image | tag | digest |"
+            echo "|---|---|---|"
+            echo "| civicpulse-backend | \`${{ github.sha }}\` | \`${{ steps.backend.outputs.digest }}\` |"
+            echo "| civicpulse-frontend | \`${{ github.sha }}\` | \`${{ steps.frontend.outputs.digest }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-k8s:
+    name: deploy-k8s
+    needs: build-push            # deploy only what was just tested, built and signed
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read             # pull from GHCR inside the cluster
+    env:
+      REPO: ${{ needs.build-push.outputs.repo }}
+      BACKEND_DIGEST: ${{ needs.build-push.outputs.backend_digest }}
+      FRONTEND_DIGEST: ${{ needs.build-push.outputs.frontend_digest }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: sigstore/cosign-installer@v4.1.2
+      - name: Cosign verify — refuse to deploy unsigned images
+        run: |
+          for img in "civicpulse-backend@${BACKEND_DIGEST}" "civicpulse-frontend@${FRONTEND_DIGEST}"; do
+            cosign verify "${REPO}/${img}" \
+              --certificate-identity "${{ github.server_url }}/${{ github.repository }}/.github/workflows/cd.yml@${{ github.ref }}" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null
+            echo "verified ${img}"
+          done
+
+      - name: Ephemeral k3d cluster
+        uses: AbsaOSS/k3d-action@v2
+        with:
+          cluster-name: ${{ env.K3D_CLUSTER }}
+          args: >-
+            --agents 1
+            -p 8081:80@loadbalancer
+            --wait
+
+      - name: Install kustomize + VPA CRD
+        run: |
+          curl -sSL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" | tar xz
+          sudo mv kustomize /usr/local/bin/
+          CRD_ONLY=true ./scripts/install-vpa.sh
+
+      - name: Namespace, app Secret and GHCR pull Secret (from GitHub Secrets)
+        env:
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          kubectl apply -f k8s/base/namespace.yaml
+          # Ephemeral cluster: if no POSTGRES_PASSWORD secret is configured, use a random one.
+          PGPW="${POSTGRES_PASSWORD:-$(openssl rand -hex 24)}"
+          kubectl -n civicpulse create secret generic civicpulse-secrets \
+            --from-literal=POSTGRES_PASSWORD="$PGPW" \
+            --from-literal=GEMINI_API_KEY="${GEMINI_API_KEY}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl -n civicpulse create secret docker-registry ghcr-pull \
+            --docker-server=ghcr.io \
+            --docker-username="${{ github.actor }}" \
+            --docker-password="${GHCR_TOKEN}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Pin the prod overlay to the signed digests (never :latest)
+        working-directory: k8s/overlays/prod
+        run: |
+          kustomize edit set image \
+            "civicpulse-backend=${REPO}/civicpulse-backend@${BACKEND_DIGEST}" \
+            "civicpulse-frontend=${REPO}/civicpulse-frontend@${FRONTEND_DIGEST}"
+          kustomize edit add annotation "civicpulse.io/git-sha:${{ github.sha }}"
+          kustomize build . | grep -E '^\s+image:'
+
+      - name: Apply, run migrations, wait for rollout
+        run: |
+          kubectl -n civicpulse delete job migrate --ignore-not-found
+          kubectl apply -k k8s/overlays/prod
+          kubectl -n civicpulse wait --for=condition=complete job/migrate --timeout=300s
+          kubectl -n civicpulse rollout status deploy/backend --timeout=300s
+          kubectl -n civicpulse rollout status deploy/frontend --timeout=300s
+
+      - name: Smoke test through the Ingress
+        run: |
+          set -euo pipefail
+          H="--resolve civicpulse.localhost:8081:127.0.0.1"
+          for _ in $(seq 1 30); do
+            # shellcheck disable=SC2086
+            curl -fsS $H http://civicpulse.localhost:8081/ -o /dev/null && break; sleep 2
+          done
+          # shellcheck disable=SC2086
+          curl -fsS $H http://civicpulse.localhost:8081/api/stats
+          echo
+          # shellcheck disable=SC2086
+          code=$(curl -sS $H -o /tmp/post.json -w '%{http_code}' -X POST \
+            http://civicpulse.localhost:8081/api/complaints -H 'Content-Type: application/json' \
+            -d '{"text":"CI smoke test: streetlights off on Street 5 for a week","location":"Street 5, CI"}')
+          cat /tmp/post.json; echo
+          test "$code" = "201"
+
+      - name: HPA status
+        run: kubectl -n civicpulse get hpa
+
+      - name: What is production running?
+        run: |
+          {
+            echo "### Deployed"
+            echo "git sha: \`${{ github.sha }}\`"
+            kubectl -n civicpulse get deploy -o custom-columns='DEPLOYMENT:.metadata.name,IMAGE:.spec.template.spec.containers[0].image'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          kubectl -n civicpulse get all,ingress,pvc
+          kubectl -n civicpulse describe pods | tail -n 120
+          kubectl -n civicpulse logs job/migrate --tail=100 || true
+          kubectl -n civicpulse logs deploy/backend --tail=100 || true
