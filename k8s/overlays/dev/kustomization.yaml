@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+# TODO(you): add dev-specific patches here, e.g. lower replica counts to
+# reduce local resource usage, or patch TRIAGE_PROVIDER to "simulated" so
+# local k3d/kind testing never spends real LLM quota. Example patch shape:
+#
+# patches:
+#   - target:
+#       kind: Deployment
+#       name: backend
+#     patch: |-
+#       - op: replace
+#         path: /spec/replicas
+#         value: 1

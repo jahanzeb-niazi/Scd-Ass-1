@@ -1,0 +1,124 @@
+# Runs on push to main (§3.4). Every job that publishes or deploys is gated
+# by `needs:` on the prior job, per the non-negotiables in §3.4.
+name: CD
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write   # needed for GHCR push, scoped only to this workflow (§3.4 least-privilege)
+
+env:
+  REGISTRY: ghcr.io
+  BACKEND_IMAGE: ghcr.io/${{ github.repository }}/backend
+  FRONTEND_IMAGE: ghcr.io/${{ github.repository }}/frontend
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      TRIAGE_PROVIDER: simulated
+    steps:
+      - uses: actions/checkout@v4
+      # TODO(you): the full suite again, on the merged result (§3.4) — mirror
+      # ci.yml's lint-and-type + test-backend + test-frontend steps here, or
+      # factor them into a reusable workflow (`workflow_call`) to avoid
+      # duplicating this block. Duplicating for now is fine to start.
+      - run: echo "TODO: full test suite, same as ci.yml"
+
+  build-push:
+    needs: [test]
+    runs-on: ubuntu-latest
+    outputs:
+      backend_digest: ${{ steps.build-backend.outputs.digest }}
+      frontend_digest: ${{ steps.build-frontend.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}   # scoped, revocable — never an account password (§3.4)
+
+      - name: Build + push backend
+        id: build-backend
+        uses: docker/build-push-action@v6
+        with:
+          context: backend
+          push: true
+          tags: |
+            ${{ env.BACKEND_IMAGE }}:${{ github.sha }}
+            ${{ env.BACKEND_IMAGE }}:latest
+          # NOTE: :latest may be PUSHED here — it must never be DEPLOYED (§3.4).
+          # The deploy job below uses github.sha exclusively.
+
+      - name: Build + push frontend
+        id: build-frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: frontend
+          push: true
+          tags: |
+            ${{ env.FRONTEND_IMAGE }}:${{ github.sha }}
+            ${{ env.FRONTEND_IMAGE }}:latest
+
+      - name: Generate SBOM (backend)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.BACKEND_IMAGE }}:${{ github.sha }}
+          format: spdx-json
+          output-file: backend-sbom.spdx.json
+
+      - name: Generate SBOM (frontend)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.FRONTEND_IMAGE }}:${{ github.sha }}
+          format: spdx-json
+          output-file: frontend-sbom.spdx.json
+
+      # TODO(you): for the bonus (Cosign signing) — sign both images here with
+      # cosign and verify in a later step. Not required for the core 150 marks.
+
+  deploy-k8s:
+    needs: [build-push]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create k3d cluster
+        uses: AbsaOSS/k3d-action@v2
+        with:
+          cluster-name: civicpulse-ci
+      - name: Install kustomize
+        run: |
+          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          sudo mv kustomize /usr/local/bin/
+      - name: Set image tags to this commit SHA
+        working-directory: k8s/overlays/prod
+        run: |
+          kustomize edit set image \
+            ghcr.io/REPLACE_ME/civicpulse-backend=${{ env.BACKEND_IMAGE }}:${{ github.sha }} \
+            ghcr.io/REPLACE_ME/civicpulse-frontend=${{ env.FRONTEND_IMAGE }}:${{ github.sha }}
+      - name: Create Secret from GitHub Secrets
+        run: |
+          kubectl create namespace civicpulse --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create secret generic backend-secrets -n civicpulse \
+            --from-literal=GROQ_API_KEY="${{ secrets.GROQ_API_KEY }}" \
+            --from-literal=DATABASE_URL="${{ secrets.DATABASE_URL }}" \
+            --from-literal=POSTGRES_PASSWORD="${{ secrets.POSTGRES_PASSWORD }}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+      - name: Apply prod overlay
+        run: kustomize build k8s/overlays/prod | kubectl apply -f -
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/backend -n civicpulse --timeout=120s
+          kubectl rollout status deployment/frontend -n civicpulse --timeout=120s
+      - name: Smoke test via Ingress
+        run: |
+          # TODO(you): resolve the Ingress host in this ephemeral cluster (k3d
+          # port-forwarding or a NodePort mapping) and curl it — the spec
+          # wants an actual HTTP assertion here, not just "pods are Running".
+          echo "TODO: implement the smoke test described in §3.4"
+      - name: Print HPA state
+        run: kubectl get hpa -n civicpulse

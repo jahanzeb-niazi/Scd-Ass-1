@@ -1,0 +1,167 @@
+# Runs on PR to main, and on push to dev (§3.4). Every publishing/deploying
+# job elsewhere needs `needs:` gating on a job like this one passing — this
+# file never publishes or deploys anything itself.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [dev]
+
+permissions:
+  contents: read   # least-privilege default (§3.4) — widen per-job only if truly needed
+
+jobs:
+  lint-and-type:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install backend deps
+        working-directory: backend
+        run: pip install --break-system-packages .[dev]
+      - name: ruff
+        working-directory: backend
+        run: ruff check .
+      - name: mypy
+        working-directory: backend
+        run: mypy app
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install frontend deps
+        working-directory: frontend
+        run: npm install
+      - name: eslint
+        working-directory: frontend
+        run: npm run lint
+      - name: tsc --noEmit
+        working-directory: frontend
+        run: npm run typecheck
+
+  test-backend:
+    runs-on: ubuntu-latest
+    env:
+      TRIAGE_PROVIDER: simulated   # pinned for determinism (§2.5, §3.4)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        working-directory: backend
+        run: pip install --break-system-packages .[dev]
+      - name: pytest with coverage
+        working-directory: backend
+        run: pytest --cov=app --cov-report=term-missing --cov-fail-under=65
+        # TODO(you): coverage floor is 65% per rubric C — this will fail until
+        # you've implemented enough of the TODO(you) stubs for real coverage.
+
+  test-frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - working-directory: frontend
+        run: npm install
+      - working-directory: frontend
+        run: npm run test
+
+  build:
+    needs: [lint-and-type, test-backend, test-frontend]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build backend image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: backend
+          push: false
+          tags: civicpulse-backend:ci
+      - name: Build frontend image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: frontend
+          push: false
+          tags: civicpulse-frontend:ci
+
+  scan:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build backend image for scan
+        uses: docker/build-push-action@v6
+        with:
+          context: backend
+          push: false
+          load: true
+          tags: civicpulse-backend:scan
+      - name: Trivy scan — backend
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: civicpulse-backend:scan
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true   # only fail on HIGH/CRITICAL with a fixed version available (§3.4)
+      - name: Build frontend image for scan
+        uses: docker/build-push-action@v6
+        with:
+          context: frontend
+          push: false
+          load: true
+          tags: civicpulse-frontend:scan
+      - name: Trivy scan — frontend
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: civicpulse-frontend:scan
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+
+  manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install kustomize
+        run: |
+          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          sudo mv kustomize /usr/local/bin/
+      - name: Install kubeconform
+        run: |
+          curl -sL https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz | tar xz
+          sudo mv kubeconform /usr/local/bin/
+      - name: Build + validate prod overlay
+        run: kustomize build k8s/overlays/prod | kubeconform -strict -summary
+
+  integration:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Copy .env.example to .env for CI
+        run: cp .env.example .env
+      - name: docker compose up
+        run: docker compose up -d --build
+      - name: Wait for /ready
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8000/ready && break
+            sleep 2
+          done
+      - name: POST a complaint and read it back
+        run: |
+          # TODO(you): script this properly — POST, capture the returned id,
+          # GET it back, assert the category field is present, and hit
+          # /api/stats twice to confirm X-Cache goes MISS then HIT. A small
+          # Python or bash+jq script committed under scripts/ is cleaner than
+          # inlining this here.
+          echo "TODO: implement the integration assertions described in §3.4"
+      - name: docker compose down
+        if: always()
+        run: docker compose down -v

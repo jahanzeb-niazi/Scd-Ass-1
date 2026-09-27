@@ -1,0 +1,32 @@
+# TODO(you): confirm your cluster's ingress controller (k3d/kind usually need
+# one installed, e.g. ingress-nginx) and that `ingressClassName` below matches
+# what's actually installed.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: civicpulse
+  namespace: civicpulse
+  annotations:
+    # TODO(you): confirm this annotation is correct for your installed controller
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: civicpulse.local   # TODO(you): pick a real local host and document
+                                 # how to add it to /etc/hosts in RUNBOOK.md
+      http:
+        paths:
+          - path: /api(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 8000
+          - path: /(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80

@@ -1,0 +1,59 @@
+# StatefulSet, NOT a Deployment — a Deployment for a database is an explicit
+# marked error per §3.3 ("be ready to explain why at viva"). The short answer:
+# a Deployment gives no stable identity/storage per replica and can run
+# multiple pods racing over the same volume; a StatefulSet gives each replica
+# a stable name and its own PVC via volumeClaimTemplates.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: civicpulse
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine   # pinned — never :latest (§5.3)
+          ports:
+            - containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: backend-secrets   # TODO(you): confirm key names match
+                                          # POSTGRES_USER/POSTGRES_PASSWORD/POSTGRES_DB
+                                          # that the postgres image itself expects —
+                                          # you likely want a DEDICATED secret for this,
+                                          # not backend-secrets reused wholesale.
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "civicpulse"]
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "civicpulse"]
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+  volumeClaimTemplates:
+    - metadata:
+        name: pgdata
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi   # TODO(you): size this realistically for your seeded dataset + headroom

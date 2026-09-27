@@ -1,0 +1,130 @@
+# Development compose file — uses `build:`. Never used in prod (see compose.prod.yaml).
+# TODO(you): after writing this, literally run `docker compose exec frontend ping database`
+# and confirm it FAILS — that failure is required evidence (§3.2).
+
+networks:
+  edge:
+    driver: bridge
+  internal:
+    driver: bridge
+    internal: true   # no route to the outside world — see the Groq/LLM trade-off note below
+
+volumes:
+  pgdata:
+  redisdata:      # AOF persistence — TODO(you): write your justification in docs/ENGINEERING-NOTES.md
+  ollama_models:  # only needed if TRIAGE_PROVIDER=ollama
+
+services:
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    networks:
+      - edge
+    ports:
+      - "5173:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    networks:
+      - edge      # so it can reach the frontend's network boundary... actually so the
+                  # frontend can reach IT — backend is the only service that bridges
+                  # edge and internal (§3.2)
+      - internal
+    ports:
+      - "8000:8000"
+    environment:
+      # TODO(you): confirm every one of these against backend/app/config.py's Settings fields
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@database:5432/${POSTGRES_DB}
+      REDIS_URL: redis://cache:6379/0
+      TRIAGE_PROVIDER: ${TRIAGE_PROVIDER:-simulated}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      OLLAMA_BASE_URL: http://ollama:11434
+      ENVIRONMENT: development
+    volumes:
+      # Dev-only bind mount for hot reload — TODO(you): write in compose.yaml
+      # (right here, as this comment) AND in your ADR why this is right for
+      # dev and absent from prod (§3.2 explicitly asks for both).
+      - ./backend/app:/app/app:ro
+    depends_on:
+      database:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+  database:
+    image: postgres:16-alpine
+    networks:
+      - internal
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    # No published port here (dev is fine to expose for debugging if you want —
+    # TODO(you): decide; prod MUST NOT publish this, see compose.prod.yaml and §5.3)
+
+  cache:
+    image: redis:7-alpine
+    networks:
+      - internal
+    command: ["redis-server", "--appendonly", "yes"]  # AOF, §2.4
+    volumes:
+      - redisdata:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  # Optional — only relevant if TRIAGE_PROVIDER=ollama. TODO(you): remove this
+  # service if your team commits to the Groq/Gemini path exclusively, or keep
+  # it as the documented fallback per §2.5 ("If free-tier keys become a
+  # problem for anyone in your team, take this path — you lose no marks for it").
+  ollama:
+    image: ollama/ollama:latest   # TODO(you): pin an actual version tag, :latest is a deduction (§5.3)
+    networks:
+      - internal    # NOTE: this means ollama itself needs no internet route once the
+                    # model is pulled — but pulling the model the FIRST time does. Work
+                    # out and document your bootstrap approach.
+    volumes:
+      - ollama_models:/root/.ollama
+    restart: unless-stopped
+
+# TODO(you): note the trade-off the spec calls out explicitly (§3.2) — `internal: true`
+# means backend cannot reach the internet from the `internal` network, but it's also on
+# `edge`. Confirm `edge` actually has outbound internet access (a plain bridge network
+# does, by default) so LLMTriage calling Groq/Gemini actually works. Write the answer
+# in docs/ENGINEERING-NOTES.md question 7.

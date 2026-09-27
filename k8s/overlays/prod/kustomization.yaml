@@ -1,0 +1,16 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+# TODO(you): this is where cd.yml should inject the real SHA-tagged images —
+# e.g. via `kustomize edit set image` run in the workflow before
+# `kustomize build overlays/prod | kubectl apply -f -`, so the deployed
+# reference is set by the pipeline, never hand-edited. Example:
+#
+# images:
+#   - name: ghcr.io/REPLACE_ME/civicpulse-backend
+#     newTag: REPLACE_WITH_SHA
+#   - name: ghcr.io/REPLACE_ME/civicpulse-frontend
+#     newTag: REPLACE_WITH_SHA
