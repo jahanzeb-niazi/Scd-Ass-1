@@ -130,6 +130,8 @@ class TriageService:
                 "complaint_id": str(complaint_id),
                 "provider": self.provider.name,
                 "error_class": error_class,
+                # e.g. "HTTP 400: API key not valid" — never contains the key.
+                "error_detail": str(error)[:240] if error else "",
             },
         )
         TRIAGE_FALLBACKS.labels(provider=self.provider.name, error=error_class).inc()

@@ -12,6 +12,7 @@ from typing import Any
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app.config import Settings, get_settings
 from app.container import Container
@@ -75,7 +76,16 @@ def create_app(settings: Settings | None = None, container: Container | None = N
         started = time.perf_counter()
         status = 500
         try:
-            response = await call_next(request)
+            try:
+                response = await call_next(request)
+            except Exception as exc:
+                # Handle here, inside the request context, so the log line and
+                # the 500 body both carry this request's id.
+                log.exception("unhandled error", extra={"error_class": type(exc).__name__})
+                response = JSONResponse(
+                    status_code=500,
+                    content={"detail": "Internal server error", "request_id": rid},
+                )
             status = response.status_code
             response.headers["X-Request-ID"] = rid
             return response

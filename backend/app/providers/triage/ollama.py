@@ -16,7 +16,7 @@ from app.providers.triage.base import (
     TriageResult,
     parse_triage_json,
 )
-from app.providers.triage.llm import raise_for_status
+from app.providers.triage.llm import error_detail, raise_for_status
 from app.providers.triage.prompt import RESPONSE_JSON_SCHEMA, SYSTEM_INSTRUCTION, build_user_prompt
 
 
@@ -48,11 +48,13 @@ class OllamaTriage:
         try:
             resp = self._client.post(self._url, json=payload)
         except httpx.TimeoutException as exc:
-            raise ProviderTimeoutError(type(exc).__name__) from exc
+            raise ProviderTimeoutError(f"{type(exc).__name__}: {exc}"[:200]) from exc
         except httpx.HTTPError as exc:
-            raise ProviderUnavailableError(type(exc).__name__) from exc
+            # e.g. "ConnectError: [Errno -3] Temporary failure in name resolution"
+            raise ProviderUnavailableError(f"{type(exc).__name__}: {exc}"[:200]) from exc
 
-        raise_for_status(resp.status_code)
+        if resp.status_code >= 400:
+            raise_for_status(resp.status_code, error_detail(resp))
         try:
             raw = resp.json()["message"]["content"]
         except (ValueError, KeyError, TypeError) as exc:
