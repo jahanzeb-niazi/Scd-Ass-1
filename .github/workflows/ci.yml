@@ -1,10 +1,10 @@
 name: CI
 
-# PRs into main (required checks), pushes to dev, and re-used by cd.yml /
+# Every PR (into dev or main), pushes to dev, and re-used by cd.yml /
 # release.yml so the full suite runs again on the merged result.
 on:
   pull_request:
-    branches: [main]
+    branches: [main, dev]
   push:
     branches: [dev]
   workflow_call:
