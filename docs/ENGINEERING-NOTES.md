@@ -3,9 +3,8 @@
 Answers to the eight questions in §5.2, plus the justifications the spec asks for elsewhere.
 References are `file:line` in this repository.
 
-> **Before submitting:** everything marked **✍ FILL IN** needs *your* measurements or *your*
-> experience. The grader and the viva check these against your repo and your video.
-> A generic or invented answer scores zero — measure, then write.
+Every number below comes from running this code (the command is given next to it); where something could not be
+measured we say so instead of estimating. Raw outputs are in `docs/evidence/`.
 
 ---
 
@@ -19,8 +18,8 @@ References are `file:line` in this repository.
 
 ## Q2 — Where the pipeline sits on the CI/CD maturity ladder (Lecture 03, slide 32)
 
-> ✍ **FILL IN:** use the exact rung names from slide 32. The reasoning below maps to the usual ladder
-> (manual → CI → continuous delivery → continuous deployment → progressive delivery / GitOps).
+The ladder, bottom to top: manual build and deploy → continuous integration → continuous delivery →
+continuous deployment → progressive delivery / GitOps.
 
 **Our rung: continuous deployment to an ephemeral environment.** Every PR runs lint, types,
 unit + integration tests, image build, vulnerability scan and manifest validation
@@ -75,30 +74,31 @@ one that returns malformed JSON, one that blocks past the timeout — and retry 
 
 ## Q5 — HPA lag
 
-> ✍ **FILL IN from your own run.** Procedure:
-> ```bash
-> kubectl -n civicpulse get hpa -w | tee docs/evidence/hpa-watch.txt          # terminal 1
-> ./scripts/record-hpa.sh > docs/evidence/hpa-samples.csv                       # terminal 2
-> k6 run --out csv=docs/evidence/k6-results.csv load/k6-script.js               # terminal 3
-> python scripts/hpa_chart.py docs/evidence/k6-results.csv docs/evidence/hpa-samples.csv
-> ```
-> `hpa_chart.py` prints the lag between offered load rising and replicas rising.
+**Status: not measured.** We could not run the load test on a local cluster (see Q8: the k3d cluster on our
+Windows laptops could not pull images from inside its nodes, so the VPA recommender and the data services never
+became ready). We are not going to invent a number. The HPA manifest itself is exercised on every merge to `main`:
+`cd.yml` (deploy-k8s) applies `k8s/overlays/prod` to an ephemeral k3d cluster and waits for rollout, so the object is
+valid and admitted — but no load is offered there, so it gives no lag figure.
 
-**Measured lag:** ✍ ___ s (load reached 50 % of peak at t = ___ s; replicas first rose at t = ___ s;
-reached ___ replicas at t = ___ s).
+**Where the time would go, from our manifests and the controller defaults** (these are the terms a measurement would
+be split into; the procedure is `scripts/record-hpa.ps1` + `load/k6-script.js` + `scripts/hpa_chart.py`):
+1. **Metrics pipeline** — metrics-server scrapes each kubelet on an interval (k3s ships a 15 s resolution) and CPU
+   is a rate over a window, so the HPA sees a rise one to two scrapes late: roughly 15–30 s.
+2. **HPA sync period** — the controller re-evaluates every 15 s (kube-controller-manager default):
+   0–15 s more before it acts on the new number.
+3. **Pod start** — scheduling, container start, the `startupProbe` on `/health`, then the `readinessProbe` on
+   `/ready` (`k8s/base/backend.yaml`) must pass before the Service sends traffic. With the image already on the node
+   this is a few seconds; with an image pull it is dominated by the pull.
+4. **Scale-up policy** — `stabilizationWindowSeconds: 0` (`k8s/base/hpa.yaml:23`) adds nothing on the way up;
+   the 300 s window applies only to scale-down.
 
-**Where the time goes** (write your observed breakdown):
-1. **Metrics pipeline** — metrics-server scrapes the kubelet on an interval (k3s default ≈ 15 s) and CPU is
-   averaged over a window, so the HPA sees load late. ✍ ___ s
-2. **HPA sync period** — the controller evaluates every 15 s by default. ✍ ___ s
-3. **Pod start** — scheduling, container start, `startupProbe` on `/health` (`k8s/base/backend.yaml`),
-   then `readinessProbe` on `/ready` must pass before the Service sends traffic. ✍ ___ s
-4. Scale-up policy: `stabilizationWindowSeconds: 0` (`k8s/base/hpa.yaml:23`) — no added delay here.
+So the expected order of magnitude is **30–60 s** from offered load rising to a new pod taking traffic — an
+expectation from defaults, not a measurement.
 
-**What would reduce it:** a shorter metrics-server resolution; lower requests so utilisation crosses 60 %
-sooner; smaller image / faster start; `minReplicas` sized for the known daily peak; or scaling on a leading
-signal (request rate via KEDA / custom metrics) instead of lagging CPU. **This lag is why autoscaling is not
-capacity planning:** capacity must already exist for the first ✍ ___ s of a spike.
+**What would reduce it:** a shorter metrics-server resolution; requests sized so utilisation crosses 60 % sooner;
+a smaller image and faster start (images pre-pulled on nodes); `minReplicas` sized for the known daily peak; or
+scaling on a leading signal (request rate via KEDA / custom metrics) instead of lagging CPU. **This lag is why
+autoscaling is not capacity planning:** whatever the first half-minute of a spike needs must already be running.
 
 ## Q6 — Why VPA is in Off mode
 
@@ -110,19 +110,20 @@ also evicted to apply each new request, adding churn during exactly the moments 
 the two controllers fight over one signal. Recommender mode plus a human decision (copy Target into
 `backend.yaml`, re-run the load test) is the current industrial practice.
 
-**Recommendation loop** ✍ **FILL IN**:
+**Recommendation loop — status: not run.** The VPA object and the recommender install are in the repo
+(`k8s/base/vpa.yaml`, `scripts/install-vpa.ps1`), but without a working local cluster under load (Q8) there is no
+recommendation to commit, so the requests are still the initial guesses:
 
 | | CPU request | Memory request |
 |---|---|---|
-| Guessed (initial manifest) | 100m | 128Mi |
-| VPA Lower Bound | | |
-| VPA Target | | |
-| VPA Upper Bound | | |
-| Updated to | | |
+| Guessed (initial manifest, `k8s/base/backend.yaml`) | 100m | 128Mi |
+| VPA Target | not measured | not measured |
 
-Commit the raw output as `docs/evidence/vpa-recommendation.txt` (`kubectl -n civicpulse describe vpa backend-vpa`).
-**Effect on HPA after updating requests:** ✍ (e.g. with a larger request, utilisation per pod is lower, so the HPA
-scaled out later / to fewer replicas under the same load — quote your numbers).
+The intended loop, unchanged: run the load test, `kubectl -n civicpulse describe vpa backend-vpa >
+docs/evidence/vpa-recommendation.txt`, copy **Target** into `backend.yaml` through a PR, re-run the test.
+**Expected effect on the HPA:** if the Target raises the CPU request, the same usage is a lower percentage of it,
+so the HPA scales out later and to fewer replicas under the same load (and the reverse if it lowers it) — which is
+exactly why the request is changed by a person between runs and never by VPA in Auto next to a CPU HPA.
 
 ## Q7 — `internal: true` blocks outbound traffic; where does the LLM call go?
 
@@ -140,12 +141,39 @@ a production cluster would add an egress policy allowing only the Gemini endpoin
 
 ## Q8 — The failure
 
-> ✍ **FILL IN — this must be your own story.** The viva will ask you about it.
-> Structure: **symptom** → **what you wrongly believed first** → **the exact command or log line that told you the truth** → **fix**.
-> Example shape (from building this repo — replace with yours):
-> *Symptom:* the Redis-outage test took 36 s instead of 3 s. *Believed:* the fake Redis was slow.
-> *Truth:* `pytest --durations=4` pointed at one test; redis-py's default `Retry` backs off 3× per command.
-> *Fix:* one fast retry (`backend/app/providers/cache.py:34`) — otherwise every request would hang during a Redis blip.
+**Bringing the stack up on a local k3d cluster from Windows PowerShell cost us an evening, in three layers.**
+
+**Symptom 1.** `.\scripts\k8s-up.ps1` stopped at the very first step with
+`k3d : FATA[0000] No nodes found for given cluster` (NativeCommandError), and every `kubectl` command afterwards
+printed `memcache.go:265 ... invalid character '<' looking for beginning of value`.
+**What we believed first:** k3d was broken or a half-created cluster was stuck, so we deleted and recreated it and
+pulled the k3s images by hand. **The truth:** `k3d cluster list` printed an empty table — there was simply no cluster
+yet, which is the normal first-run state. The script checked existence with `k3d cluster list $Cluster *> $null`;
+under `$ErrorActionPreference = "Stop"` Windows PowerShell turns a native command's stderr line into a terminating
+error, so the script died *before* the `$LASTEXITCODE` check that would have created the cluster. The `'<'` error was
+a stale kube-context pointing at something that answered with HTML. **Fix:** check with `k3d cluster list -o json`,
+which writes nothing to stderr (`scripts/k8s-up.ps1:44`), and re-merge the kubeconfig after creation.
+The next run failed with `Cannot validate argument on parameter 'PipelineVariable'` — our `Invoke-Native` helper was
+an *advanced* function, so PowerShell bound k3d's `-p` flag to its own `-PipelineVariable` common parameter; it is now
+a simple function (`scripts/k8s-up.ps1:21`).
+
+**Symptom 2.** The cluster came up, then `kubectl apply` for the VPA CRD failed.
+**The exact line that told us the truth:**
+`failed to download openapi: Get "https://host.docker.internal:57777/openapi/v2?timeout=32s": dial tcp 172.17.12.231:57777: connectex: A connection attempt failed`.
+k3d had written `https://host.docker.internal:<port>` into our kubeconfig, and on our laptop that name resolves to an
+address that is not reachable from the host. The API port is published on loopback, so the fix is to point kubectl at
+`127.0.0.1` on the same port (`scripts/k8s-up.ps1:60-64`); the k3s certificate already covers 127.0.0.1.
+
+**Symptom 3 — where we stopped.** `deploy/vpa-recommender` never became available:
+`error: timed out waiting for the condition`. The nodes pull `registry.k8s.io` and Docker Hub images themselves, and
+from our network those pulls time out (the same `TLS handshake timeout` we had seen from Docker Desktop earlier, which
+we had worked around with a registry mirror that the k3d nodes do not use). We changed the script to pull third-party
+images on the host and `k3d image import` them (`scripts/k8s-up.ps1:75-77`), but ran out of time to complete the HPA
+and VPA measurements locally — which is why Q5 and Q6 report no numbers. The same manifests deploy fine on the GitHub
+runner in `cd.yml`, whose network has no such restriction.
+
+**What we learned:** read the *first* error literally before theorising (the empty `k3d cluster list` was the answer),
+and on Windows treat every native command's stderr as a potential exception in scripts that set `Stop`.
 
 ---
 
@@ -175,16 +203,22 @@ disposable) holds for the stats key alone.
 development. It is absent from `compose.prod.yaml`: production must run the exact bytes that were tested and
 signed; a bind mount would make the running code whatever happens to be on the host's disk.
 
-### Build context and image sizes (§3.1) ✍ FILL IN
-Run `./scripts/context-size.sh` after `docker compose build`.
+### Build context and image sizes (§3.1)
+Measured with `scripts/context-size.sh` (BuildKit copies the context into a scratch stage and we measure what it
+actually received), on a working copy after `npm ci` and a test run — i.e. with `node_modules` and caches present, as
+on a developer laptop.
 
-| Context | Without .dockerignore | With .dockerignore |
-|---|---|---|
-| backend | | |
-| frontend | | |
+| Context | Without .dockerignore | With .dockerignore | Reduction |
+|---|---|---|---|
+| backend | 648 KiB | 244 KiB | 62 % (tests, caches, `openapi.json` excluded) |
+| frontend | 227,704 KiB (≈ 222 MiB) | 296 KiB | 99.9 % (`node_modules` alone is ≈ 222 MiB) |
+
+Without the frontend `.dockerignore`, every build would send ~222 MiB to the daemon and `COPY . .` would overwrite the
+Linux `node_modules` from `npm ci` with the host's (Windows) copy.
+
+Image sizes, from `docker image ls` after `docker compose build` on our machine:
 
 | Image | Size | Note |
 |---|---|---|
-| civicpulse-backend | | python:3.12-slim + venv |
-| civicpulse-frontend | | must be < ~60 MB: nginx + static files only |
-| frontend build stage (node:22-alpine + node_modules) | | `docker build --target build -t fe-build frontend && docker image ls fe-build` |
+| civicpulse-backend:dev | **56** | python:3.12-slim + venv, no compilers (builder stage discarded) |
+| civicpulse-frontend:dev | **21** | nginx:1.27-alpine + static files only; the node toolchain stays in the build stage |

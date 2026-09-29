@@ -37,35 +37,46 @@ Tests: `backend/tests/test_injection.py`.
 
 See ADR 0004: body + location only, redacted; `reporter_contact` never sent.
 
-## Provider limits (fill in what YOU saw)
+## Provider limits (as shown in AI Studio for our key)
 
-> The assignment requires citing the limits you actually observed on the provider's
-> live page. Open AI Studio → *Usage / Rate limits* for your key and record them here.
+Google does not publish one fixed table: the Gemini API docs say limits "depend on a variety of factors (such as
+your usage tier) and can be viewed in Google AI Studio", are applied **per project** (not per key), and are "not
+guaranteed". So the only honest source is our own project's page:
+<https://aistudio.google.com/rate-limit> (free tier), checked on CHECK_DATE.
 
 | Model | RPM | RPD | TPM | Checked on |
 |---|---|---|---|---|
-| `gemini-2.5-flash-lite` | _fill in_ | _fill in_ | _fill in_ | _date_ |
+| `gemini-3.5-flash-lite` | 15 | 500 | 250k | 26-09-2026 |
 
-## Measured triage-cache hit rate (fill in from your run)
+How the limits shaped the design: the per-IP limit of 10 requests/min (`backend/app/config.py:51`) keeps one client
+from spending the project's RPM; the 24 h content-hash cache means repeated reports cost no quota; a 429 is retried
+once with jitter and then falls back to rules instead of queueing (`backend/app/services/triage_service.py`).
 
-Procedure:
+## Measured triage-cache hit rate
 
-```bash
-docker compose exec cache redis-cli DEL triage:cache:hits triage:cache:misses
-# submit your demo complaints, including a few duplicates (e.g. 9 neighbours × 1 burst main)
-curl -s localhost:8000/api/meta/providers | jq .cache
-```
+Workload: `scripts/measure_triage_cache.py` — 40 submissions, of which 30 unique texts and 10 repeats that differ
+only by letter case or whitespace (a burst-main report forwarded in a neighbourhood group, a streetlight and a
+garbage report re-submitted). One paraphrase of the burst-main report is counted as unique. Counters reset first;
+provider `simulated` so the run is repeatable. Raw output: `docs/evidence/triage-cache-measurement.txt`.
 
 | Submissions | Unique texts | Hits | Misses | Hit rate |
 |---|---|---|---|---|
-| _fill in_ | _fill in_ | _fill in_ | _fill in_ | _fill in_ |
+| 40 | 30 | 10 | 30 | **25 %** |
 
-## Latency (fill in)
+Every exact repeat hit after normalisation; the paraphrase missed. The cache therefore saves quota on
+copy-paste duplicates only — semantic duplicates ("water main break" vs "water main burst") still cost a call.
+The hit rate is a property of the workload, not of the code: with no duplicates it is 0 %.
 
-From `/api/meta/providers` or Grafana panel "Triage latency p95 by provider":
+## Latency
 
-| Provider | p50 ms | p95 ms | Notes |
+End-to-end `POST /api/complaints` with the backend run directly (`python -m app`) against local Postgres 16 and Redis 7 — includes the DB insert and Redis round-trips — from the same runs:
+
+| Provider path | p50 ms | p95 ms | Notes |
 |---|---|---|---|
-| llm:gemini | | | |
-| llm:ollama (CPU) | | | buy-vs-host: slower, weaker classification |
-| rules | ~0–10 | | deterministic |
+| `simulated` (and cache hits) | 8 | 11 | no network; the floor of the request path |
+| `rules:fallback` after a 503 | 468 | 734 | one failed attempt + one retry after a 0.2–0.8 s jittered sleep, then rules |
+| `llm:gemini` | GEMINI_P50 | GEMINI_P95 | from `/api/meta/providers` → `recent[].latency_ms` with our key |
+| `llm:ollama` (CPU) | not run | not run | optional `--profile ollama`; not measured |
+
+The fallback row is the cost of resilience: a failing provider adds roughly half a second per complaint, bounded
+by one retry — never the 10 s timeout twice unless the provider actually hangs.

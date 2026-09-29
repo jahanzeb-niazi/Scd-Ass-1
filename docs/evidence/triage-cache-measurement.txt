@@ -1,0 +1,31 @@
+Triage content-hash cache: measured run
+=======================================
+Script:     scripts/measure_triage_cache.py (40 submissions: 30 unique texts + 10 repeats)
+Run:        backend started with `python -m app` against local PostgreSQL 16 and Redis 7
+Provider:   TRIAGE_PROVIDER=simulated (deterministic, no network); RATE_LIMIT_REQUESTS=1000 for this run only
+Counters:   reset before the run (DEL triage:cache:hits triage:cache:misses)
+Date:       2026-09-29
+
+GET /api/meta/providers -> cache
+{
+ "hits": 10,
+ "misses": 30,
+ "hit_rate": 0.25
+}
+submissions 40 unique 30
+end-to-end POST latency (all 40): p50 8.0 ms, p95 10.6 ms
+
+Notes
+- The 10 repeats differ only by letter case / extra spaces / a trailing space; normalisation
+  (case-fold + collapse whitespace) maps them to the same key, so all 10 were hits.
+- One entry is a paraphrase of the burst-main report ("Someone reported a water main break...");
+  it is counted among the 30 unique texts and was a MISS, as expected: the cache is exact-match
+  on normalised text, not semantic.
+
+Fallback run: SIMULATED_FAILURE_MODE=error, SIMULATED_FAILURE_RATE=1.0, 20 submissions
+- all 20 returned 201 with triaged_by = rules:fallback
+- end-to-end POST latency: p50 468 ms, p95 734 ms
+  (failed attempt + one retry after a 0.2-0.8 s jittered sleep, then the rules provider)
+- one WARNING per complaint, e.g.
+  {"level": "WARNING", "logger": "app.services.triage_service", "message": "triage fallback to rules",
+   "provider": "simulated", "error_class": "ProviderServerError", "error_detail": "simulated 503", ...}

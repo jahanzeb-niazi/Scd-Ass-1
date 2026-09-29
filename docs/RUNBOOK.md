@@ -26,6 +26,7 @@ IMAGE_REPO=ghcr.io/<owner>/civicpulse IMAGE_TAG=<full-commit-sha> \
 
 ```bash
 ./scripts/k8s-up.sh                # cluster + images + VPA + secret + dev overlay
+# Windows PowerShell: .\scripts\k8s-up.ps1
 open http://civicpulse.localhost:8081
 ```
 
