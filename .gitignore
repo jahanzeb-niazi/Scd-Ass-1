@@ -1,4 +1,4 @@
-# Secrets — never commit
+# --- secrets: never committed (−20 per §5.3) ---
 .env
 .env.*
 !.env.example
@@ -24,4 +24,3 @@ frontend/coverage/
 .idea/
 .vscode/
 .DS_Store
-

@@ -1,0 +1,239 @@
+name: CI
+
+# PRs into main (required checks), pushes to dev, and re-used by cd.yml /
+# release.yml so the full suite runs again on the merged result.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [dev]
+  workflow_call:
+
+# Least privilege: CI only reads the repository. It never publishes anything.
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "22"
+  KUSTOMIZE_VERSION: "5.8.1"
+  KUBECONFORM_VERSION: "0.8.0"
+
+jobs:
+  lint-and-type:
+    name: lint-and-type
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+      - name: Backend — ruff + mypy
+        working-directory: backend
+        run: |
+          pip install -r requirements-dev.txt
+          ruff check .
+          ruff format --check .
+          mypy
+      - name: Backend — OpenAPI document is up to date
+        working-directory: backend
+        run: |
+          python -m app.export_openapi > openapi.json
+          git diff --exit-code -- openapi.json
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Frontend — eslint + tsc --noEmit + typed client matches OpenAPI
+        working-directory: frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npm run lint
+          npm run typecheck
+          npm run check:api
+
+  test-backend:
+    name: test-backend
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: civicpulse
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: civicpulse_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U civicpulse -d civicpulse_test"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql://civicpulse:ci-only-password@localhost:5432/civicpulse_test
+      TRIAGE_PROVIDER: simulated   # CI is deterministic by construction
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+      - name: pytest (coverage ≥ 65% on app/, enforced in pyproject.toml)
+        working-directory: backend
+        run: |
+          pip install -r requirements-dev.txt
+          pytest --cov --cov-report=term --cov-report=xml
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: backend-coverage
+          path: backend/coverage.xml
+          if-no-files-found: ignore
+
+  test-frontend:
+    name: test-frontend
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Vitest component tests
+        working-directory: frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npm test
+
+  build:
+    name: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      # Build only. A pull request must never publish artifacts.
+      - name: Build backend image
+        uses: docker/build-push-action@v7
+        with:
+          context: backend
+          push: false
+          load: true
+          tags: civicpulse-backend:ci
+          build-args: GIT_SHA=${{ github.sha }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+      - name: Build frontend image
+        uses: docker/build-push-action@v7
+        with:
+          context: frontend
+          push: false
+          load: true
+          tags: civicpulse-frontend:ci
+          build-args: GIT_SHA=${{ github.sha }}
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend
+      - name: Report image sizes
+        run: docker image ls --format '{{.Repository}}:{{.Tag}} {{.Size}}' | grep '^civicpulse-' | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Save images for the scan job
+        run: docker save civicpulse-backend:ci civicpulse-frontend:ci -o images.tar
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ci-images
+          path: images.tar
+          retention-days: 1
+
+  scan:
+    name: scan
+    needs: build
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [civicpulse-backend, civicpulse-frontend]
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: ci-images
+      - run: docker load -i images.tar
+      - name: Trivy — fail on HIGH/CRITICAL with a fixed version available
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ matrix.image }}:ci
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          vuln-type: os,library
+          exit-code: "1"
+          format: table
+
+  manifests:
+    name: manifests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install kustomize + kubeconform
+        run: |
+          curl -sSL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" | tar xz
+          curl -sSL "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" | tar xz kubeconform
+      - name: kustomize build | kubeconform (both overlays)
+        run: |
+          for overlay in prod dev; do
+            echo "::group::overlays/${overlay}"
+            ./kustomize build "k8s/overlays/${overlay}" | ./kubeconform -strict -summary \
+              -kubernetes-version 1.33.0 \
+              -schema-location default \
+              -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+            echo "::endgroup::"
+          done
+
+  integration:
+    name: integration
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Prepare .env (simulated triage, throwaway password)
+        run: |
+          cp .env.example .env
+          sed -i "s/^TRIAGE_PROVIDER=.*/TRIAGE_PROVIDER=simulated/" .env
+          sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=ci-${{ github.run_id }}/" .env
+      - name: docker compose up
+        run: docker compose up -d --build
+      - name: Wait for /ready
+        run: |
+          for _ in $(seq 1 60); do
+            if curl -fsS http://localhost:8000/ready; then echo; exit 0; fi
+            sleep 3
+          done
+          docker compose ps; docker compose logs --tail=100; exit 1
+      - name: POST a complaint through the frontend, GET it back
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 20); do curl -fsS http://localhost:8080/healthz && break; sleep 2; done
+          body='{"text":"Burst water main flooding Street 12 since fajr, water entering ground floors","location":"Street 12, Gulshan-e-Iqbal"}'
+          resp=$(curl -fsS -X POST http://localhost:8080/api/complaints -H 'Content-Type: application/json' -d "$body")
+          echo "$resp"
+          id=$(echo "$resp" | jq -r .id)
+          got=$(curl -fsS "http://localhost:8080/api/complaints/${id}")
+          test "$(echo "$got" | jq -r .category)" = "water"
+          test "$(echo "$got" | jq -r .priority)" = "high"
+          test "$(echo "$got" | jq -r .triaged_by)" = "simulated"
+      - name: X-Cache goes MISS → HIT
+        run: |
+          set -euo pipefail
+          first=$(curl -fsS -D - -o /dev/null http://localhost:8080/api/stats | tr -d '\r' | awk -F': ' 'tolower($1)=="x-cache"{print $2}')
+          second=$(curl -fsS -D - -o /dev/null http://localhost:8080/api/stats | tr -d '\r' | awk -F': ' 'tolower($1)=="x-cache"{print $2}')
+          echo "first=$first second=$second"
+          test "$first" = "MISS" && test "$second" = "HIT"
+      - name: Network isolation — frontend cannot reach the database
+        run: |
+          if docker compose exec -T frontend sh -c 'getent hosts database || nc -z -w 2 database 5432'; then
+            echo "frontend reached the database: segmentation is broken"; exit 1
+          fi
+          echo "OK: frontend has no route to database"
+      - name: Logs on failure
+        if: failure()
+        run: docker compose logs --tail=200
+      - name: docker compose down -v
+        if: always()
+        run: docker compose down -v
