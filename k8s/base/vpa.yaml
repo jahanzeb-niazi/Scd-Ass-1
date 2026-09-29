@@ -1,0 +1,22 @@
+# Vertical Pod Autoscaler in RECOMMENDER mode only.
+#
+# updateMode "Off": VPA computes Target / Lower Bound / Upper Bound but never
+# evicts or resizes pods. A human copies the recommendation into backend.yaml.
+# Auto mode here would fight the HPA: both act on CPU — VPA raises the request,
+# which lowers computed utilisation, which makes HPA scale in, which raises
+# per-pod load, which makes VPA raise the request again.
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: backend-vpa
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: backend
+  updatePolicy:
+    updateMode: "Off"
+  resourcePolicy:
+    containerPolicies:
+      - containerName: backend
+        controlledResources: ["cpu", "memory"]
