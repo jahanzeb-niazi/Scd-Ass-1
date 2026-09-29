@@ -206,3 +206,12 @@ def test_factory_selects_by_env(choice: str, name: str) -> None:
     provider = build_provider(make_settings(triage_provider=choice))
     assert isinstance(provider, TriageProvider)
     assert provider.name == name
+
+
+def test_gemini_error_message_is_surfaced_without_the_key() -> None:
+    body = {"error": {"code": 400, "message": "API key not valid. Please pass a valid API key."}}
+    llm, _ = _gemini(400, body)
+    with pytest.raises(ProviderRequestError) as info:
+        llm.triage("water leak", "x")
+    assert "API key not valid" in str(info.value)
+    assert "secret-key" not in str(info.value)

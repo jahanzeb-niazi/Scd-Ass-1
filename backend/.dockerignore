@@ -1,0 +1,23 @@
+# Keep the build context to what the image needs. Report before/after sizes in
+# docs/ENGINEERING-NOTES.md (see scripts/context-size.sh).
+.git
+.gitignore
+.venv
+venv
+__pycache__
+**/__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+coverage.xml
+htmlcov
+.env
+.env.*
+tests
+openapi.json
+requirements-dev.txt
+Dockerfile
+.dockerignore
+*.md

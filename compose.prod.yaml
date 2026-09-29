@@ -1,0 +1,134 @@
+# CivicPulse — production stack.
+#   IMAGE_REPO=ghcr.io/<owner>/civicpulse IMAGE_TAG=<commit-sha> docker compose -f compose.prod.yaml up -d
+#
+# Rules this file keeps (rubric G, §5.3):
+#   * image: only — there is no build: key anywhere; images are immutable, tagged by commit SHA
+#   * no bind mounts of source code
+#   * no published port on database or cache; only the frontend is reachable
+name: civicpulse-prod
+
+x-restart: &restart
+  restart: unless-stopped
+
+x-backend-image: &backend-image
+  image: ${IMAGE_REPO:?set IMAGE_REPO, e.g. ghcr.io/owner/civicpulse}-backend:${IMAGE_TAG:?set IMAGE_TAG to a commit SHA}
+
+x-backend-env: &backend-env
+  POSTGRES_HOST: database
+  POSTGRES_PORT: "5432"
+  POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+  POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+  REDIS_URL: redis://cache:6379/0
+  TRIAGE_PROVIDER: ${TRIAGE_PROVIDER:-llm}
+  GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+  GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash-lite}
+  TRIAGE_TIMEOUT_S: ${TRIAGE_TIMEOUT_S:-10}
+  RATE_LIMIT_REQUESTS: ${RATE_LIMIT_REQUESTS:-10}
+  RATE_LIMIT_WINDOW_S: ${RATE_LIMIT_WINDOW_S:-60}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  TRUST_PROXY_HEADERS: "true"
+
+services:
+  database:
+    image: postgres:16-alpine
+    <<: *restart
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 1G }
+
+  cache:
+    image: redis:7-alpine
+    <<: *restart
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--save", ""]
+    volumes:
+      - redisdata:/data
+    networks: [internal]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 256M }
+
+  migrate:
+    <<: *backend-image
+    # Production: migrations only. No seed data in prod.
+    command: ["alembic", "upgrade", "head"]
+    environment: *backend-env
+    networks: [internal]
+    depends_on:
+      database:
+        condition: service_healthy
+    restart: "no"
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 256M }
+
+  backend:
+    <<: [*backend-image, *restart]
+    environment: *backend-env
+    networks: [edge, internal]
+    depends_on:
+      database:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status == 200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 512M }
+
+  frontend:
+    image: ${IMAGE_REPO:?set IMAGE_REPO}-frontend:${IMAGE_TAG:?set IMAGE_TAG to a commit SHA}
+    <<: *restart
+    environment:
+      BACKEND_UPSTREAM: backend:8000
+    networks: [edge]
+    ports:
+      - "80:8080"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 128M }
+
+networks:
+  edge:
+    driver: bridge
+  internal:
+    driver: bridge
+    internal: true
+
+volumes:
+  pgdata:
+  redisdata:

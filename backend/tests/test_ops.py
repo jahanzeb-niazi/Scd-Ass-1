@@ -15,7 +15,7 @@ from app.config import get_settings
 from app.container import Container
 from app.logging_config import JsonFormatter, request_id_var
 from app.main import create_app
-from tests.conftest import VALID, make_settings
+from tests.conftest import VALID, ClientFactory, make_settings
 
 
 def test_health_does_not_touch_the_database() -> None:
@@ -130,3 +130,14 @@ def test_redis_outage_degrades_instead_of_failing(clean_db: str) -> None:
         ready = client.get("/ready")
         assert ready.status_code == 503 and ready.json()["failed"] == ["redis"]
     container.close()
+
+
+def test_unhandled_error_is_500_with_the_request_id(make_client: ClientFactory) -> None:
+    client = make_client()
+    client.app.state.container.stats._load = lambda: 1 / 0  # type: ignore[attr-defined]
+    client.app.state.container.cache.delete("stats:v1")  # type: ignore[attr-defined]
+    client.raise_server_exceptions = False
+    r = client.get("/api/stats", headers={"X-Request-ID": "boom-1"})
+    assert r.status_code == 500
+    assert r.json() == {"detail": "Internal server error", "request_id": "boom-1"}
+    assert r.headers["x-request-id"] == "boom-1"

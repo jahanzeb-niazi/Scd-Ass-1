@@ -1,0 +1,41 @@
+# Production overlay — applied by cd.yml to an ephemeral k3d cluster.
+#
+# The image references below are placeholders. cd.yml replaces them with the
+# exact digests it just pushed and signed:
+#   kustomize edit set image civicpulse-backend=ghcr.io/<owner>/civicpulse-backend@sha256:<digest>
+# so production runs an immutable reference, never :latest (ADR 0003).
+# Migrations only — no seed data in prod.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+images:
+  - name: civicpulse-backend
+    newName: ghcr.io/OWNER/civicpulse-backend
+    newTag: set-by-cd
+  - name: civicpulse-frontend
+    newName: ghcr.io/OWNER/civicpulse-frontend
+    newTag: set-by-cd
+
+patches:
+  # The real Secret is created from GitHub Secrets by cd.yml (see base/secret.yaml).
+  - target: { kind: Secret, name: civicpulse-secrets }
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: civicpulse-secrets
+  # GHCR images are private by default: pull with a scoped, read-only token.
+  - target: { kind: Deployment }
+    patch: |-
+      - op: add
+        path: /spec/template/spec/imagePullSecrets
+        value: [{ name: ghcr-pull }]
+  - target: { kind: Job, name: migrate }
+    patch: |-
+      - op: add
+        path: /spec/template/spec/imagePullSecrets
+        value: [{ name: ghcr-pull }]
