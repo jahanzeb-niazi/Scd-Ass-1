@@ -5,6 +5,10 @@
 # ------------------------------------------------------------------ build
 FROM node:22-alpine AS build
 WORKDIR /src
+
+# Update all packages to fix security vulnerabilities
+RUN apk update && apk upgrade
+
 # Dependencies first (cache-friendly): only a lockfile change re-runs npm ci.
 COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
@@ -19,6 +23,9 @@ ARG GIT_SHA=unknown
 LABEL org.opencontainers.image.title="civicpulse-frontend" \
       org.opencontainers.image.source="https://github.com/OWNER/civicpulse" \
       org.opencontainers.image.revision="${GIT_SHA}"
+
+# Update all packages to fix security vulnerabilities (including zlib CVE-2026-22184)
+RUN apk update && apk upgrade
 
 # Run as the unprivileged `nginx` user (uid 101): move the pid file to /tmp,
 # drop the `user` directive, and let nginx own the dirs it writes at runtime
