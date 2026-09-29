@@ -36,14 +36,31 @@ from app.providers.triage.prompt import (
 )
 
 
-def raise_for_status(status: int) -> None:
+def error_detail(resp: httpx.Response) -> str:
+    """Short, key-free reason from an error response, e.g. 'API key not valid'.
+
+    Gemini and Ollama both return JSON errors; the API key is sent in a header
+    and never appears in the body, so this is safe to log.
+    """
+    try:
+        body = resp.json()
+        err = body.get("error") if isinstance(body, dict) else None
+        msg = err.get("message") if isinstance(err, dict) else err
+        text = str(msg or resp.text)
+    except ValueError:
+        text = resp.text
+    return " ".join(text.split())[:200]
+
+
+def raise_for_status(status: int, detail: str = "") -> None:
     """Shared HTTP-status → error-class mapping for hosted and local LLMs."""
+    suffix = f": {detail}" if detail else ""
     if status == 429:
-        raise ProviderRateLimitedError("HTTP 429")
+        raise ProviderRateLimitedError(f"HTTP 429{suffix}")
     if status >= 500:
-        raise ProviderServerError(f"HTTP {status}")
+        raise ProviderServerError(f"HTTP {status}{suffix}")
     if status >= 400:
-        raise ProviderRequestError(f"HTTP {status}")
+        raise ProviderRequestError(f"HTTP {status}{suffix}")
 
 
 class LLMTriage:
@@ -89,11 +106,13 @@ class LLMTriage:
                 headers={"x-goog-api-key": self._api_key},
             )
         except httpx.TimeoutException as exc:
-            raise ProviderTimeoutError(type(exc).__name__) from exc
+            raise ProviderTimeoutError(f"{type(exc).__name__}: {exc}"[:200]) from exc
         except httpx.HTTPError as exc:
-            raise ProviderUnavailableError(type(exc).__name__) from exc
+            # e.g. "ConnectError: [Errno -3] Temporary failure in name resolution"
+            raise ProviderUnavailableError(f"{type(exc).__name__}: {exc}"[:200]) from exc
 
-        raise_for_status(resp.status_code)
+        if resp.status_code >= 400:
+            raise_for_status(resp.status_code, error_detail(resp))
         try:
             body = resp.json()
             raw = body["candidates"][0]["content"]["parts"][0]["text"]
